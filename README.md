@@ -1,5 +1,11 @@
-﻿# dsh-evolution-core
+# dsh-evolution-core
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-evolution-core"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 进化核心插件（心脏）：把分散、被动、无内驱力的进化器官（self-test / skill-forge / emotion / reflection / life-core / evolve / memory / checkpoint）聚合为**可观测、可诊断、可驱动**的运行时——补上「五环完整性」（猜想→采证→finding→裁决→布线）的缺环，让进化从被动响应变主动推进。
 
 设计文档：`docs/evolution-core-design.md`
