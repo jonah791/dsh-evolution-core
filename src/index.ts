@@ -36,7 +36,9 @@ import {
   summarizeEvolve, summarizeMemory, summarizeCheckpoints,
   diagnoseRings, buildSuggestions, computeHistoryStats, buildSummary,
 } from './core.ts'
-import type { HistoryEvent, OrganSnapshot } from './core.ts'
+import type { OrganSnapshot } from './core.ts'
+import { TYPE_LABEL, renderOrganLine, ringMark, clampDays, hasRedRing } from './format.ts'
+import { readHistory, appendHistory } from './history-store.ts'
 
 export const name = 'evolution-core'
 // memoryApi：可选回流服务（dsh-agent-memory 提供；cycle/log 足迹回流主记忆库）
@@ -209,60 +211,6 @@ function readWireSignal(config: Config): number | null {
   return newest
 }
 
-// ---------- 履历（history.jsonl） ----------
-
-function historyPath(dataDir: string): string {
-  return join(dataDir, 'history.jsonl')
-}
-function readHistory(dataDir: string): HistoryEvent[] {
-  const p = historyPath(dataDir)
-  const out: HistoryEvent[] = []
-  try {
-    if (!existsSync(p)) return out
-    const lines = readFileSync(p, 'utf-8').split('\n')
-    for (const line of lines) {
-      if (!line.trim()) continue
-      try {
-        const ev = JSON.parse(line) as HistoryEvent
-        if (typeof ev?.ts === 'string' && typeof ev?.type === 'string') out.push(ev)
-      } catch {
-        // 损坏行跳过（torn tail 容错）
-      }
-    }
-  } catch {
-    // 不可读 → 空
-  }
-  return out
-}
-
-let historyCounter = 0
-function nextHistoryId(): string {
-  historyCounter += 1
-  return `e-${Date.now().toString(36)}-${historyCounter}`
-}
-
-function appendHistory(dataDir: string, ev: { type: string; detail?: string; ref?: string | null }): { id: string; ts: string } | null {
-  try {
-    mkdirSync(dataDir, { recursive: true })
-    const full: HistoryEvent = {
-      id: nextHistoryId(),
-      ts: new Date().toISOString(),
-      type: ev.type,
-      detail: ev.detail ?? '',
-      ref: ev.ref ?? null,
-    }
-    appendFileSync(historyPath(dataDir), JSON.stringify(full) + '\n', 'utf-8')
-    return { id: full.id, ts: full.ts }
-  } catch {
-    return null
-  }
-}
-
-const TYPE_LABEL: Record<string, string> = {
-  cycle: '感知圈', verdict: '裁决', forge: '炼化', evolve: '评测',
-  wire: '布线', reflect: '反思', checkpoint: '存档', note: '备注',
-}
-
 // ---------- 聚合核心（status/cycle 共用） ----------
 
 async function aggregate(config: Config): Promise<{
@@ -285,33 +233,6 @@ async function aggregate(config: Config): Promise<{
   const { rings, broken } = diagnoseRings({ selftest, lastWireDays })
   const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastWireDays })
   return { organs, rings, broken, suggestions }
-}
-
-/** 渲染一行的器官状态（compact） */
-function renderOrganLine(key: string, o: OrganSnapshot): string {
-  if (o.ok !== true) return `${key}: ⚠不可读`
-  switch (key) {
-    case 'selftest':
-      return `selftest: 共${o.total} 活跃${o.active} finding${o.finding} ✓${o.confirmed} ✗${o.refuted}`
-    case 'emotion':
-      return `emotion: today=${o.today} 触发${o.triggerCount}次 工具${Array.isArray(o.statsKeys) ? o.statsKeys.length : 0}种`
-    case 'reflection':
-      return `reflection: 上次${o.lastTriggerDate} 共${o.triggerCount}次`
-    case 'lifeCore':
-      return `life-core: ${o.status} 今日${o.todayTurns}圈 周期${o.cycleMinutes}min`
-    case 'memory':
-      return `memory: 条目${o.entryCount}`
-    case 'checkpoints':
-      return `checkpoints: ${o.count}个 最近${o.latest ?? '—'}（${o.latestAgeDays ?? '?'}天前）`
-    case 'evolve':
-      return `evolve: ${o.generationCount}代 最近${o.lastGenAt ? String(o.lastGenAt).slice(0, 10) : '—'} 闲置${o.idleDays ?? '?'}天`
-    default:
-      return `${key}: ${JSON.stringify(o)}`
-  }
-}
-
-function ringMark(state: string): string {
-  return state === 'green' ? '🟢' : state === 'yellow' ? '🟡' : state === 'red' ? '🔴' : '⚪'
 }
 
 // ---------- apply ----------
@@ -346,7 +267,7 @@ export function apply(ctx: Context, config: Config): void {
     })
     return {
       at: now,
-      hasBlocker: agg.rings.some((r) => r.state === 'red'),
+      hasBlocker: hasRedRing(agg.rings),
       rings: JSON.parse(JSON.stringify(agg.rings)),
       broken: JSON.parse(JSON.stringify(agg.broken)),
       suggestions: agg.suggestions,
@@ -458,7 +379,7 @@ export function apply(ctx: Context, config: Config): void {
       if (!config.enabled) return { ok: false, error: 'evolution-core disabled', cycleId: undefined, at: undefined, status: undefined, recommendedActions: undefined, hasBlocker: false, logged: false }
       const now = new Date().toISOString()
       const agg = await aggregate(config)
-      const hasBlocker = agg.rings.some((r) => r.state === 'red')
+      const hasBlocker = hasRedRing(agg.rings)
       const loggedEv = appendHistory(dataDir, { type: 'cycle', detail: args.note ?? '' })
       if (loggedEv !== null) refluxEvent({ type: 'cycle', detail: args.note ?? '', id: loggedEv.id })
       const evolveIdle = agg.organs.evolve?.ok === true ? (agg.organs.evolve.idleDays as number | null | undefined) ?? null : null
@@ -554,7 +475,7 @@ export function apply(ctx: Context, config: Config): void {
       if (!config.enabled) return { ok: false, error: 'evolution-core disabled' }
       const events = readHistory(dataDir)
       const now = new Date()
-      const days = Math.min(Math.max(args.days ?? 30, 1), 3650)
+      const days = clampDays(args.days)
       const cutoff = new Date(now.getTime() - days * 86400000)
       const filtered = events.filter((e) => new Date(e.ts).getTime() >= cutoff.getTime())
       const stats = computeHistoryStats(filtered, now)
