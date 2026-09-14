@@ -12,9 +12,14 @@ export const TYPE_LABEL: Record<string, string> = {
   wire: '布线', reflect: '反思', checkpoint: '存档', note: '备注',
 }
 
-/** 渲染一行的器官状态（compact） */
-export function renderOrganLine(key: string, o: OrganSnapshot): string {
-  if (o.ok !== true) return `${key}: ⚠不可读`
+/**
+ * 渲染一行的器官状态（compact）
+ *
+ * `null` / `undefined` 与 `ok !== true` 同口径（`⚠不可读`）——判空不再只存在于调用方
+ * （`aggregateSnapshot` 的 `organ === undefined ? ... : renderOrganLine(...)` 只是纵深防御）。
+ */
+export function renderOrganLine(key: string, o: OrganSnapshot | null | undefined): string {
+  if (o === null || o === undefined || o.ok !== true) return `${key}: ⚠不可读`
   switch (key) {
     case 'selftest':
       return `selftest: 共${o.total} 活跃${o.active} finding${o.finding} ✓${o.confirmed} ✗${o.refuted}`
@@ -45,7 +50,14 @@ export function clampDays(days: number | undefined): number {
   return Math.min(Math.max(days ?? 30, 1), 3650)
 }
 
-/** 是否存在红环断点 */
-export function hasRedRing(rings: Array<Pick<RingState, 'state'>>): boolean {
-  return rings.some((r) => r.state === 'red')
+/**
+ * 是否存在红环断点
+ *
+ * 非数组（`null`/`undefined`/脏载荷）→ `false`，与本文件既有口径一致：
+ * 「读不出的环项按非红处理（保守：不谎报红环）」——红环只由真实观测到的 `state === 'red'` 产生。
+ * 环级不可读性由 `diagnoseRings` 的 `{state:'yellow', detail:'数据源不可读'}` 与器官行 `⚠不可读` 各自显式呈现。
+ */
+export function hasRedRing(rings: Array<Pick<RingState, 'state'>> | null | undefined): boolean {
+  if (!Array.isArray(rings)) return false
+  return rings.some((r) => r?.state === 'red')
 }

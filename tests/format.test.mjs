@@ -61,12 +61,14 @@ test('退化：renderOrganLine 缺字段 → 不抛（显示 undefined 原值，
   assert.equal(renderOrganLine('evolve', { ok: true }), 'evolve: undefined代 最近— 闲置?天')
 })
 
-test('已登记缺口 L2（本次未改行为）：null/undefined 快照读 o.ok 会抛——调用点必须判空', () => {
-  // 现状锁定：renderOrganLine 直接读 o.ok。两个调用点均在外部判空
-  // （aggregateSnapshot 用 `organ === undefined ? '⚠不可读' : ...`；工具 render 的 organs 来自 JSON 载荷恒为对象）。
-  // 从调用点移除判空即会把这里变成线上崩溃——本断言就是那道护栏的哨兵。
-  assert.throws(() => renderOrganLine('selftest', null), TypeError)
-  assert.throws(() => renderOrganLine('selftest', undefined), TypeError)
+test('L2 已修（2026-09-14）：null/undefined 快照 → 同 ok!==true 口径（⚠不可读），不抛', () => {
+  // 修复前：直接读 o.ok → TypeError；判空只存在于调用方（aggregateSnapshot 的 `organ === undefined ? ... : ...`），
+  // 从调用点移除判空即线上崩溃（本断言原本是那道护栏的哨兵）。
+  // 修复后：函数自持边界，文案与调用点原兜底串逐字相同（`${k}: ⚠不可读`）——行为不变，护栏下移。
+  assert.equal(renderOrganLine('selftest', null), 'selftest: ⚠不可读')
+  assert.equal(renderOrganLine('selftest', undefined), 'selftest: ⚠不可读')
+  assert.equal(renderOrganLine('memory', null), 'memory: ⚠不可读')
+  assert.doesNotThrow(() => renderOrganLine('x', null))
 })
 
 // ---------- ringMark ----------
@@ -113,6 +115,11 @@ test('退化：hasRedRing 喂缺 state 的脏环项 → 不抛且按非红处理
   assert.equal(hasRedRing([{ state: 'red' }, {}]), true)
 })
 
-test('已登记缺口 L3（本次未改行为）：环项为 null 会抛——环数组恒由 diagnoseRings 产出', () => {
-  assert.throws(() => hasRedRing([null]), TypeError)
+test('L3 已修（2026-09-14）：环项为 null / 载荷非数组 → 不抛且按非红处理（保守）', () => {
+  assert.equal(hasRedRing([null]), false)
+  assert.equal(hasRedRing([null, {}, { state: 'yellow' }]), false)
+  assert.equal(hasRedRing([null, { state: 'red' }]), true) // 真红仍被看见（不因脏项而漏报）
+  assert.equal(hasRedRing(null), false)
+  assert.equal(hasRedRing(undefined), false)
+  assert.equal(hasRedRing('nope'), false)
 })

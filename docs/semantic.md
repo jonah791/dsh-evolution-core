@@ -75,6 +75,7 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 | 布线 `≤ 7` / `≤ 30` / `null 或 > 30` 天 | 布线环 green / yellow / red+断点 | core.ts:276-287 |
 | 建议排序 | 不可读器官 → finding 积压 → evolve 闲置（>14 红 / >7 黄）→ 猜想/采证 → 布线（>7）→ 存档（>3）→ 兜底「五环健康」 | core.ts:302-349 |
 | `evolution_history` 的 `days` | `clampDays`：缺省 30，收敛到 `[1, 3650]` | format.ts:44 |
+| 呈现层的**空值边界（2026-09-14 自持）** | `renderOrganLine(key, null/undefined)` → `${key}: ⚠不可读`（与 `ok !== true` 同口径，文案与 `aggregateSnapshot` 原兜底串逐字相同）；`hasRedRing(null/undefined/非数组)` → `false`（读不出的环项按非红处理——不谎报红环，真红仍被看见） | format.ts（函数内自持，调用点判空降为纵深防御） |
 
 ### 4.3 调用点清单
 | 调用方 | 调用点（文件:符号 / 行号） | 时机 |
@@ -143,7 +144,10 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 
 ## 9 · 实践修订记录
 
-- **2026-09-14 补课：本插件此前无语义文档（可维护性工程）**
+- **2026-09-14 修复两条已登记缺口（任务 `t-b5bcd8c5`，format.ts 自持边界）**
+  - **L2**：`renderOrganLine` 直接读 `o.ok` ⇒ `null`/`undefined` 快照抛 `TypeError`，判空只存在于调用方（`aggregateSnapshot` 的 `organ === undefined ? ... : ...`）——从调用点移除判空即线上崩溃。现函数内自持：`null`/`undefined` 与 `ok !== true` 同口径返回 `${key}: ⚠不可读`（**文案与调用点原兜底串逐字相同 ⇒ 行为不变，只是护栏下移**）。
+  - **L3**：`hasRedRing([null])` 抛 `TypeError`（环数组此前恒由 `diagnoseRings` 产出 = 隐式前提）。现非数组 → `false`，沿用本文件既有口径「读不出的环项按非红处理（保守）」；与 `{state}` 缺失项同判据，且不因脏项漏报真红。
+  - 测试 61/61 全绿；两条哨兵由 `assert.throws` 翻为行为断言（`format.test.mjs`）。
   - 语义**被确认**：四工具面（status/cycle/log/history）、三原则（只读器官 / 不自动执行 / 仅经工具面呈现）、五环判定表、`history.jsonl` 契约、`evolutionCore` 服务被 `dsh-life-core` 消费。
   - 语义**被补充**：器官路径与默认值（含 `evolveLedgerPath` 落在 **DSH_HOME 之外**）；布线环用**技能目录 mtime 代理**而非真实事件；回流的字段（`kind:'episodic'`、`key:'evolve-history-<id>'`）与**静默失败**；不可读降 `yellow` 而非 `red`。
   - 语义**被修正**：无（首次成文）；但登记四处文档/声明与实现的偏差（设计文档死引用、构建滞后、`wireFreshDays` 半死、`inject` 与「可选」冲突）——见 §8。
