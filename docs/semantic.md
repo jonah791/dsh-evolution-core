@@ -133,7 +133,7 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 
 - 主实现：`src/index.ts`（499 行，IO+工具+服务）、`src/core.ts`（425 行，零 IO 纯逻辑）、`src/format.ts`（51 行，零 IO 呈现）、`src/history-store.ts`（68 行，履历 IO）；同语义副本：无。
 - **未实现 / 未验证 / 偏差（不粉饰）**：
-  - **设计文档是死引用**：`docs/evolution-core-design.md` 被 `src/index.ts:5`、`src/core.ts:5`、`README.md:11` 引用，但该文件**不存在**（`docs/` 即本次补课新建）——设计依据只能从源码与本文恢复。
+  - **设计文档是死引用**：`docs/design/evolution-core-design.md` 被 `src/index.ts:5`、`src/core.ts:5`、`README.md:11` 引用，但该文件**不存在**（`docs/` 即本次补课新建）——设计依据只能从源码与本文恢复。
   - **构建滞后已消除，但「未生效」与教训保留**：`lib/` 曾仅 `index.js`/`core.js`（均 09-07 14:26），落后源码约三天；并行实例已于 **09-14 10:30:36** 重建（8 文件，含 `format.js`/`history-store.js`，晚于 src 10:24:55）——**但 web 进程启动于 10:05:47，早于产物 mtime ⇒ 线上仍在跑 09-07 旧构建**（旧构建自洽；新源码能力须重启才生效）。教训：mtime 只证明「构建过」，生效判据必须含**进程启动时刻**（§5.11 §6）。
   - **测试只覆盖一半**：`tests/core.test.mjs` 只 import `../lib/core.js`；`format.ts`/`history-store.ts`/`index.ts`（工具面、服务、回流、参数校验）**无测试** ⇒ A5–A8 只能线上取证。
   - **死 import**：`src/index.ts:31` 导入的 `writeFileSync` 与 `appendFileSync` 在 `index.ts` 内**均未使用**（写操作已抽到 `history-store.ts`）；`tsconfig.json` 未开 `noUnusedLocals`，tsc 不报。
@@ -162,7 +162,7 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 
 ## 10 · 未决问题
 
-- **U1 死引用清理**：`docs/evolution-core-design.md` 被 3 处引用却不存在——补写设计文档，还是把引用改指本文？倾向**改指本文**（避免两份平行语义，I1）。
+- **U1 死引用清理**：`docs/design/evolution-core-design.md` 被 3 处引用却不存在——补写设计文档，还是把引用改指本文？倾向**改指本文**（避免两份平行语义，I1）。
 - **U2 `memoryApi` 硬依赖还是软依赖**：`inject` 声明为硬（激活门），实现为软（判 `undefined` 跳过回流）。软则改 `ctx.get('memoryApi')` 且移出 `inject`；硬则删注释与容错分支。需裁决并一次性收敛（涉及与 `dsh-agent-memory` 的挂载顺序）。
 - **U3 `wireFreshDays` 归属**：参数化 `core.ts` 的 7/30 阈值（环判定接受入参 + 补单测），还是从 `Config` 移除？现状「配置存在但不生效」是最差路径。
 - **U4 重建已做、重启未做的收口**：`lib/` 已重建（09-14 10:30:36，8 文件）但 web 进程（10:05:47 启动）尚未加载 ⇒ 何时重启生效，是否由正在改造的**该实例**收口时统一走哨兵（§5.11 进程级判据 + §5.14 不重复劳动）？
