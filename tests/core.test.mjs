@@ -150,20 +150,30 @@ test('五环诊断：数据源不可读 → 前四环 yellow（不误报红）+ 
   assert.deepEqual(broken, [])
 })
 
-test('五环诊断·猜想环边界：active=2 绿 / 1 黄 / 0 红+断点', () => {
+test('五环诊断·猜想环边界：active=2 绿 / 1 黄 / 0 且有终态=空窗黄（不列断点）/ 库全空=红+断点', () => {
   assert.equal(ring(diagnoseRings({ selftest: selftest({ active: 2 }), lastWireDays: 1 }).rings, 'hypothesize').state, 'green')
   assert.equal(ring(diagnoseRings({ selftest: selftest({ active: 1 }), lastWireDays: 1 }).rings, 'hypothesize').state, 'yellow')
-  const r0 = diagnoseRings({ selftest: selftest({ active: 0 }), lastWireDays: 1 })
-  assert.equal(ring(r0.rings, 'hypothesize').state, 'red')
-  assert.equal(r0.broken[0].signal, 'selftest active 假设 = 0')
+  // 空窗（2026-09-21）：库里有终态假设 ⇒ active=0 是**收敛态**，不是断点（不列入 broken、不催补假设）
+  const empty = diagnoseRings({ selftest: selftest({ active: 0, activeWithEvidence: false, confirmed: 3, refuted: 5 }), lastWireDays: 1 })
+  assert.equal(ring(empty.rings, 'hypothesize').state, 'yellow')
+  assert.match(ring(empty.rings, 'hypothesize').detail, /空窗/)
+  assert.equal(empty.broken.some((b) => b.ring === 'hypothesize'), false)
+  // 真断点：库里既无 active 也无终态
+  const none = diagnoseRings({ selftest: selftest({ active: 0, activeWithEvidence: false, confirmed: 0, refuted: 0 }), lastWireDays: 1 })
+  assert.equal(ring(none.rings, 'hypothesize').state, 'red')
+  assert.match(none.broken[0].signal, /库为空/)
 })
 
-test('五环诊断·采证环边界：有证据绿 / 无证据黄 / 无 active 红+断点', () => {
+test('五环诊断·采证环边界：有证据绿 / 无证据黄 / 空窗黄 / 库空红+断点', () => {
   assert.equal(ring(diagnoseRings({ selftest: selftest({ active: 2, activeWithEvidence: true }), lastWireDays: 1 }).rings, 'evidence').state, 'green')
   assert.equal(ring(diagnoseRings({ selftest: selftest({ active: 2, activeWithEvidence: false }), lastWireDays: 1 }).rings, 'evidence').state, 'yellow')
-  const r = diagnoseRings({ selftest: selftest({ active: 0, activeWithEvidence: false }), lastWireDays: 1 })
-  assert.equal(ring(r.rings, 'evidence').state, 'red')
-  assert.equal(r.broken[1].ring, 'evidence') // broken[0] 是猜想环（先入列）
+  const empty = diagnoseRings({ selftest: selftest({ active: 0, activeWithEvidence: false, confirmed: 3, refuted: 5 }), lastWireDays: 1 })
+  assert.equal(ring(empty.rings, 'evidence').state, 'yellow')
+  assert.match(ring(empty.rings, 'evidence').detail, /空窗/)
+  const none = diagnoseRings({ selftest: selftest({ active: 0, activeWithEvidence: false, confirmed: 0, refuted: 0 }), lastWireDays: 1 })
+  assert.equal(ring(none.rings, 'evidence').state, 'red')
+  // 入列顺序：猜想先于采证（裁决环此时也会红——库空 ⇒ 无终态，属预期）
+  assert.deepEqual(none.broken.map((b) => b.ring).slice(0, 2), ['hypothesize', 'evidence'])
 })
 
 test('五环诊断·finding 环边界：0 绿 / 1 红+断点（积压即红）', () => {
@@ -237,10 +247,16 @@ test('buildSuggestions·评测边界：>14 红建议 / 14 走黄建议 / 7 不�
   assert.equal(run(7).some((s) => s.includes('【评测】')), false)
 })
 
-test('buildSuggestions·猜想/采证互斥：无 active → 猜想；有 active 无证据 → 采证', () => {
+test('buildSuggestions·猜想/采证三分：库空→补猜想；空窗→劝住手（写明门槛）；有 active 无证据→采证', () => {
   const base = { evolve: { ok: true, idleDays: 1 }, checkpoints: { ok: true, latestAgeDays: 0 }, lastWireDays: 1 }
-  assert.deepEqual(buildSuggestions({ ...base, selftest: selftest({ active: 0, activeWithEvidence: false }) }),
+  assert.deepEqual(buildSuggestions({ ...base, selftest: selftest({ active: 0, activeWithEvidence: false, confirmed: 0, refuted: 0 }) }),
     ['【猜想】无检验中猜想：selftest_add 一条可证伪自我假设（statement + prediction + probe）'])
+  // 空窗（2026-09-21）：有终态记录 ⇒ 不催补假设，改为提醒门槛（防 Goodhart：为点亮环而造假设）
+  const empty = buildSuggestions({ ...base, selftest: selftest({ active: 0, activeWithEvidence: false, confirmed: 3, refuted: 5 }) })
+  assert.equal(empty.length, 1)
+  assert.match(empty[0], /^【猜想】空窗（8 条已终态/)
+  assert.match(empty[0], /不要为点亮该环而新增假设/)
+  assert.equal(empty.some((l) => /selftest_add 一条可证伪/.test(l)), false)
   assert.deepEqual(buildSuggestions({ ...base, selftest: selftest({ active: 2, activeWithEvidence: false }) }),
     ['【采证】有 active 假设但证据 0：检查探针配置是否合理（tool 名/阈值/窗口），或确认行为确实未触发'])
 })

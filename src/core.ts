@@ -226,25 +226,33 @@ export function diagnoseRings(input: RingInput): { rings: RingState[]; broken: B
   const rings: RingState[] = []
   const broken: BrokenRing[] = []
 
-  // ① 猜想：active ≥2 green / 1 yellow / 0 red
+  // ① 猜想：active ≥2 green / 1 yellow / 0 但库里有终态＝**空窗（yellow）** / 库全空 red
   if (!stOk) {
     rings.push({ name: 'hypothesize', label: '猜想', state: 'yellow', detail: '数据源不可读' })
   } else if (active >= 2) {
     rings.push({ name: 'hypothesize', label: '猜想', state: 'green', detail: `${active} 条检验中猜想` })
   } else if (active === 1) {
     rings.push({ name: 'hypothesize', label: '猜想', state: 'yellow', detail: '仅 1 条检验中猜想' })
+  } else if (verdictTotal > 0) {
+    // 2026-09-21 加：区分「空窗」与「断点」。库里有终态假设（confirm/refute 都算）说明引擎在跑、
+    // 纪律已收敛；此时 active=0 是**收敛态**而非缺猜想。不区分就会每圈催"补一条"——那是拿指标当目标
+    // （Goodhart）。空窗只提示、不列为 broken。
+    rings.push({ name: 'hypothesize', label: '猜想', state: 'yellow',
+      detail: `空窗（${verdictTotal} 条已终态：${num(st?.confirmed)} 确认 / ${num(st?.refuted)} 淘汰）——收敛态，非断点` })
   } else {
-    rings.push({ name: 'hypothesize', label: '猜想', state: 'red', detail: '无检验中猜想（0 active）' })
-    broken.push({ ring: 'hypothesize', state: 'red', signal: 'selftest active 假设 = 0', suggestion: 'selftest_add 一条可证伪自我假设' })
+    rings.push({ name: 'hypothesize', label: '猜想', state: 'red', detail: '库为空：既无检验中猜想，也无终态记录' })
+    broken.push({ ring: 'hypothesize', state: 'red', signal: 'selftest 库为空（active=0 且 终态=0）', suggestion: 'selftest_add 一条可证伪自我假设' })
   }
 
-  // ② 采证：active 有证据 green / active 但全 0 yellow / 无 active red（假设环红则随红，避免双报）
+  // ② 采证：active 有证据 green / active 但全 0 yellow / 空窗 yellow / 库空 red
   if (!stOk) {
     rings.push({ name: 'evidence', label: '采证', state: 'yellow', detail: '数据源不可读' })
   } else if (active > 0 && st?.activeWithEvidence === true) {
     rings.push({ name: 'evidence', label: '采证', state: 'green', detail: `${active} 条 active 假设证据在累积` })
   } else if (active > 0) {
     rings.push({ name: 'evidence', label: '采证', state: 'yellow', detail: 'active 假设证据均为 0（探针未命中或未配置）' })
+  } else if (verdictTotal > 0) {
+    rings.push({ name: 'evidence', label: '采证', state: 'yellow', detail: '无 active 假设可采证（空窗：既有猜想都已完成采证）' })
   } else {
     rings.push({ name: 'evidence', label: '采证', state: 'red', detail: '无 active 假设可采证' })
     broken.push({ ring: 'evidence', state: 'red', signal: '无 active 假设', suggestion: '先 selftest_add 建立检验中猜想' })
@@ -327,7 +335,10 @@ export function buildSuggestions(input: SuggestionInput): string[] {
   }
 
   const active = st?.ok === true ? num(st?.active) : 0
-  if (active === 0 && st?.ok === true) {
+  const terminal = st?.ok === true ? num(st?.confirmed) + num(st?.refuted) : 0
+  if (active === 0 && st?.ok === true && terminal > 0) {
+    out.push(`【猜想】空窗（${terminal} 条已终态：猜想环空着＝收敛，不是缺猜想）。**不要为点亮该环而新增假设**——满足门槛才开（① 该量没有任何已终态仪器能测 ② 是我现在真的不确定的纪律），否则转机制承载（把序/计数做进工具链）`)
+  } else if (active === 0 && st?.ok === true) {
     out.push('【猜想】无检验中猜想：selftest_add 一条可证伪自我假设（statement + prediction + probe）')
   } else if (active > 0 && st?.activeWithEvidence !== true && st?.ok === true) {
     out.push('【采证】有 active 假设但证据 0：检查探针配置是否合理（tool 名/阈值/窗口），或确认行为确实未触发')

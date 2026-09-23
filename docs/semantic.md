@@ -68,8 +68,8 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 | 输入状态 | 裁决 | 依据 |
 |---------|------|------|
 | 前四环器官快照 `ok !== true` | 该环 `yellow`（detail=`数据源不可读`），**无断点** | I5；core.ts:230/242/254/264 |
-| `active ≥ 2` / `= 1` / `= 0` | 猜想环 green / yellow / red+断点 | core.ts:232-239 |
-| `active > 0 且 activeWithEvidence` / `active > 0 无证据` / `active = 0` | 采证环 green / yellow / red+断点 | core.ts:244-251 |
+| `active ≥ 2` / `= 1` / `= 0` **且库中有终态** / `= 0` **且库全空** | 猜想环 green / yellow / **yellow「空窗」（不列断点）** / red+断点 | core.ts `diagnoseRings`①（2026-09-21 改） |
+| `active > 0 且 activeWithEvidence` / `active > 0 无证据` / `active = 0 且库中有终态` / `active = 0 且库全空` | 采证环 green / yellow / **yellow「空窗」** / red+断点 | core.ts `diagnoseRings`②（同上） |
 | `finding = 0` / `≥ 1` | finding 环 green / red+断点（积压即红） | core.ts:256-261 |
 | `confirmed + refuted ≥ 5` / `1–4` / `0` | 裁决环 green / yellow / red+断点 | core.ts:266-273 |
 | 布线 `≤ 7` / `≤ 30` / `null 或 > 30` 天 | 布线环 green / yellow / red+断点 | core.ts:276-287 |
@@ -143,6 +143,13 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
   - **并行改造中（含未核实项）**：`src/format.ts`、`src/history-store.ts`、`tests/`、`package.json` 由**另一并行实例**于 09-14 10:24–10:26 引入/改动且未提交（`git status`：`M src/index.ts` / `M package.json` / `?? src/format.ts` / `?? src/history-store.ts` / `?? tests/`）——本文行号以 `src/*.ts` @ 2026-09-14 10:24 为快照，可能随后续改造漂移；旧构建（09-07 `lib/index.js`）与当前源码的**逐行行为差异面未核实**。
 
 ## 9 · 实践修订记录
+
+- **2026-09-21 判定表补「空窗」分支：收敛不再被误报成断点（`active == 0` 的多态化）**
+  - **触发缺口**：`active == 0` 一律判 `red + 断点`，于是**收敛（该淘汰的都淘汰了）被读成"缺猜想"**，每圈催一句「selftest_add 一条」——红灯的含义被压成单一计数，区分不了「断点」与「收敛」，属**指标分辨力不足**（告警疲劳 + 诱导"为点灯而造假设"）。
+  - **修订**：猜想环 `active = 0` **且库中有终态**（`confirmed + refuted > 0`）⇒ `yellow`「空窗（N 条已终态：X 确认 / Y 淘汰）——收敛态，非断点」，**不列入 broken**；库**全空**才仍判红+断点（真·从没建过假设）。采证环同口径（空窗 ⇒ 黄）。建议文案在空窗时改为念**开启门槛**（① 该量无任何已终态仪器能测 ② 真的不确定；否则转机制承载），不再输出 `selftest_add`。
+  - **回归**：`tsc -p tsconfig.json` exit 0；`tests/core.test.mjs` 3 条断言按新语义改写（猜想环/采证环边界 + 建议三分），**37/37** 通过；全库 **61/61**。
+  - **线上复核**：重启后实调 `evolution_status` → `🟡猜想 🟡采证 🟢finding 🟢裁决 🟢布线`，建议仅 1 条且正是门槛提醒 ✓
+  - 教训：① **修指标 ≠ 修自己**——把状态机补成能分辨的多态（空窗 / 断点 / 进行中），比每圈手工裁决便宜得多，而且规则从此住在代码里；② 改语义时**旧断言失败是预期的**（旧测试断言的是旧语义），判据是"新断言逐条对应新语义"，不是"测试没红"。
 
 - **2026-09-14 修复两条已登记缺口（任务 `t-b5bcd8c5`，format.ts 自持边界）**
   - **L2**：`renderOrganLine` 直接读 `o.ok` ⇒ `null`/`undefined` 快照抛 `TypeError`，判空只存在于调用方（`aggregateSnapshot` 的 `organ === undefined ? ... : ...`）——从调用点移除判空即线上崩溃。现函数内自持：`null`/`undefined` 与 `ok !== true` 同口径返回 `${key}: ⚠不可读`（**文案与调用点原兜底串逐字相同 ⇒ 行为不变，只是护栏下移**）。
