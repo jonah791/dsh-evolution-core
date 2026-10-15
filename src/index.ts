@@ -247,8 +247,13 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // 进化足迹回流主记忆库（2026-09-06）：cycle/log 写入 history.jsonl 的同时回流记忆（memoryApi 可选，不可用静默）。
+  // 2026-09-26 修（任务 t-5b08143e）：**cycle 不再回流**——它频次最高（一天 25~30 圈）、增量价值最低，
+  // 且 kind=episodic 走 L2/L3「同标题自动合并」⇒「## 进化足迹：感知圈」条目只增不减
+  // （实测 20,796 字符、每天 +1~2K，一个月后 ~50K）。history.jsonl 不受影响，evolution_history 仍完整。
+  const REFLUX_TYPES = new Set(['verdict', 'forge', 'evolve', 'wire', 'reflect', 'checkpoint', 'note'])
   const refluxEvent = (ev: { type: string; detail: string; id: string | null }): void => {
     try {
+      if (!REFLUX_TYPES.has(ev.type)) return
       const api = (ctx as unknown as { memoryApi?: { remember(input: { text: string; kind?: string; tags?: string[]; key?: string }): Promise<unknown> } }).memoryApi
       if (api === undefined) return
       const typeLabel: Record<string, string> = { cycle: '感知圈', verdict: '裁决', forge: '炼化', evolve: '评测轮', wire: '布线', reflect: '反思', checkpoint: '存档', note: '备注' }
