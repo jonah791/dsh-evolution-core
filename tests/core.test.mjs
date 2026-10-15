@@ -241,10 +241,14 @@ test('buildSuggestions：finding 积压 → 裁决建议（优先级仅次于不
 
 test('buildSuggestions·评测边界：>14 红建议 / 14 走黄建议 / 7 不提示 / 8 走黄建议', () => {
   const run = (idleDays) => buildSuggestions({ selftest: selftest(), evolve: { ok: true, idleDays }, checkpoints: { ok: true, latestAgeDays: 0 }, lastWireDays: 1 })
-  assert.deepEqual(run(15), ['【评测】evolve 已闲置 15 天（>14 红）：考虑发起评测轮（evolve_round_start + evolve_spawn + evolve_submit）'])
-  assert.deepEqual(run(14), ['【评测】evolve 闲置 14 天（>7 黄）：可考虑发起一轮评测'])
-  assert.deepEqual(run(8), ['【评测】evolve 闲置 8 天（>7 黄）：可考虑发起一轮评测'])
+  // ★ 2026-10-15：主人重申「别跑进化轮了，收益不高，基准太旧」⇒ 建议文案必须**把「最小探测」与「完整轮」分开**
+  //   （否则它会把人推去 spawn/submit —— 实测：我探测完顺手跑了整轮，正是这个形状）。
+  assert.deepEqual(run(15), ['【评测】evolve 已闲置 15 天（>14 红）：⚠ **完整评测轮已由主人暂停**（09-20 定调 / 10-15 重申：收益不高、基准太旧）⇒ **不要 spawn/submit**；只做**最小探测**（一次 start 即可定性仪器死活）；真要跑整轮**先问主人**'])
+  assert.deepEqual(run(14), ['【评测】evolve 闲置 14 天（>7 黄）：完整评测轮**已暂停**（主人 09-20/10-15）⇒ **不 spawn/submit**；可做**最小探测**（一次 start）'])
+  assert.deepEqual(run(8), ['【评测】evolve 闲置 8 天（>7 黄）：完整评测轮**已暂停**（主人 09-20/10-15）⇒ **不 spawn/submit**；可做**最小探测**（一次 start）'])
   assert.equal(run(7).some((s) => s.includes('【评测】')), false)
+  // 尸体：两档**必须不同**（红档更强，含「先问主人」）—— 若把两档写成同一句，这条会红
+  assert.notEqual(run(15)[0], run(8)[0], '★ 红/黄两档不得合并成同一句（否则阈值失去区分力）')
 })
 
 test('buildSuggestions·猜想/采证三分：库空→补猜想；空窗→劝住手（写明门槛）；有 active 无证据→采证', () => {

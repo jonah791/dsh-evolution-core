@@ -328,10 +328,14 @@ export function buildSuggestions(input: SuggestionInput): string[] {
   }
 
   const idleDays = ev?.ok === true ? (ev?.idleDays as number | null | undefined) : null
+  // ⚠ 主人 2026-09-20 定调 + 2026-10-15 重申：「别跑进化轮了，**收益不高，测试基准太旧了**」
+  //   ⇒ **完整评测轮（spawn + submit）已暂停**；但 §5.16 要的**最小探测**（判仪器死活）不受影响。
+  //   ⇒ 建议文案必须**把这两件事分开** —— 否则建议会把人推去跑整轮
+  //     （2026-10-15 实测：我探测完**顺手把整轮也跑了**，正是这个形状）。
   if (idleDays !== null && idleDays !== undefined && idleDays > 14) {
-    out.push(`【评测】evolve 已闲置 ${idleDays} 天（>14 红）：考虑发起评测轮（evolve_round_start + evolve_spawn + evolve_submit）`)
+    out.push(`【评测】evolve 已闲置 ${idleDays} 天（>14 红）：⚠ **完整评测轮已由主人暂停**（09-20 定调 / 10-15 重申：收益不高、基准太旧）⇒ **不要 spawn/submit**；只做**最小探测**（一次 start 即可定性仪器死活）；真要跑整轮**先问主人**`)
   } else if (idleDays !== null && idleDays !== undefined && idleDays > 7) {
-    out.push(`【评测】evolve 闲置 ${idleDays} 天（>7 黄）：可考虑发起一轮评测`)
+    out.push(`【评测】evolve 闲置 ${idleDays} 天（>7 黄）：完整评测轮**已暂停**（主人 09-20/10-15）⇒ **不 spawn/submit**；可做**最小探测**（一次 start）`)
   }
 
   const active = st?.ok === true ? num(st?.active) : 0
