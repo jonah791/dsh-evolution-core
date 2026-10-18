@@ -22,7 +22,8 @@
  *   - memory:    $DSH_HOME/storages/agent_memory.json（1.5MB，只读顶层键）
  *   - checkpoints:$DSH_HOME/checkpoints/（目录列表）
  *   - evolve:    <DSH_HOME 上级>/.evolve/ledger.json（⚠ DSH_HOME 外；config.evolveLedgerPath 可覆盖）
- *   - wire 代理: 技能目录最新 mtime（$DSH_HOME/skills + 工作区 ~/.agents/skills）
+ *   - wire **真源**: selftest 最新一条**普通** confirmed 的 updatedAt（自指闭环最后合上）
+ *   - wire 代理量: 技能目录最新 mtime（$DSH_HOME/skills + ~/.agents/skills）——**只做背离检测**
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -34,7 +35,7 @@ import { homedir } from 'node:os'
 import {
   summarizeSelftest, summarizeEmotion, summarizeReflection, summarizeLifeCore,
   summarizeEvolve, summarizeMemory, summarizeCheckpoints,
-  diagnoseRings, buildSuggestions, computeHistoryStats, buildSummary,
+  diagnoseRings, buildSuggestions, computeHistoryStats, buildSummary, daysBetween,
 } from './core.ts'
 import type { OrganSnapshot } from './core.ts'
 import { TYPE_LABEL, renderOrganLine, ringMark, clampDays, hasRedRing } from './format.ts'
@@ -76,7 +77,7 @@ export interface Config {
   evolveLedgerPath?: string
   /** 额外布线信号目录（技能等，可选，不存在则跳过） */
   wireSignalDirs?: string[]
-  /** 布线判定阈值：最近布线距今天数 ≤ 此值 = green（默认 7） */
+  /** 布线环 green 阈值（天）：**真源**（自指闭环最后合上）≤ 此值 = green（默认 7） */
   wireFreshDays: number
 }
 export const Config = z.object({
@@ -198,8 +199,14 @@ function readCheckpoints(): OrganSnapshot {
   return summarizeCheckpoints(names, new Date())
 }
 
-/** 布线信号：技能目录（核心目录 + 配置附加目录）最新 mtime → 距今天数 */
-function readWireSignal(config: Config): number | null {
+/**
+ * **代理量**：技能目录最新 mtime → 距今天数。
+ *
+ * ⚠ 2026-10-18 降级（原为布线环的**唯一**判据）：任何技能文件写入都让这个数变新——
+ * 同步镜像 / 改错别字 / 编辑技能全算，于是「环常绿」而自指闭环可以停 27 天（Proxy Drift 实测）。
+ * 它现在**只用于背离检测**（文件在动 ∧ 闭环停着 ⇒ 报「代理量背离」），不参与环状态判定。
+ */
+function readFileActivity(config: Config): number | null {
   const now = new Date()
   const dirs = [join(dshHome(), 'skills'), join(homedir(), '.agents', 'skills')]
   if (Array.isArray(config.wireSignalDirs)) dirs.push(...config.wireSignalDirs)
@@ -229,9 +236,14 @@ async function aggregate(config: Config): Promise<{
     checkpoints: readCheckpoints(),
     evolve: readEvolve(resolveEvolveLedger(config)),
   }
-  const lastWireDays = readWireSignal(config)
-  const { rings, broken } = diagnoseRings({ selftest, lastWireDays })
-  const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastWireDays })
+  // 布线环：**真源**取 selftest 的普通 confirmed（与 dsh-agent-self-rewrite 同源同纪律）；
+  // 文件 mtime 降级为**代理量**，只喂背离检测。
+  const latestConfirmedAt = typeof selftest.latestConfirmedAt === 'string' ? selftest.latestConfirmedAt : undefined
+  const lastConfirmedDays = daysBetween(latestConfirmedAt, new Date())
+  const fileActivityDays = readFileActivity(config)
+  const wireFreshDays = config.wireFreshDays
+  const { rings, broken } = diagnoseRings({ selftest, lastConfirmedDays, fileActivityDays, wireFreshDays })
+  const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastConfirmedDays, fileActivityDays, wireFreshDays })
   return { organs, rings, broken, suggestions }
 }
 
@@ -500,5 +512,7 @@ export function apply(ctx: Context, config: Config): void {
     // ctx.on / tools.register 由 cordis 自动释放
   })
 
-  logger.info(`ready (dataDir=${dataDir}, evolveLedger=${resolveEvolveLedger(config)}, wireFreshDays=${config.wireFreshDays})`)
+  logger.info(`ready (dataDir=${dataDir}, evolveLedger=${resolveEvolveLedger(config)}, wireFreshDays=${config.wireFreshDays} → 生效于真源「普通 confirmed」; fileActivity=仅背离检测)`)
+  // 2026-10-18：wireFreshDays 原为「半死参数」（只进日志、阈值硬编码）——现已接通 core.wireThresholds。
+  // 语义文档 U3 由此关闭；wireSignalDirs 仍是文件活动目录（代理量），语义已随之改名。
 }

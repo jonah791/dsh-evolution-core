@@ -62,7 +62,7 @@ function num(v: unknown): number {
 
 // ---------- 器官快照抽取（入参 = 已 parse 的 JSON；容错） ----------
 
-/** self-test.json → {total,active,finding,confirmed,refuted,activeWithEvidence,latestUpdatedAt} */
+/** self-test.json → {total,active,finding,confirmed,refuted,activeWithEvidence,latestUpdatedAt,latestConfirmedAt} */
 export function summarizeSelftest(raw: unknown): OrganSnapshot {
   const r = raw as { hypotheses?: unknown[] } | null
   const hs = Array.isArray(r?.hypotheses) ? (r!.hypotheses as any[]) : []
@@ -79,7 +79,21 @@ export function summarizeSelftest(raw: unknown): OrganSnapshot {
       latestUpdatedAt = h.updatedAt
     }
   }
-  return { ok: true, total: hs.length, active, finding, confirmed, refuted, activeWithEvidence, latestUpdatedAt }
+  // 自指闭环**真源**：最新一条**普通** confirmed 的 updatedAt（= 裁决→布线最后合上时刻）。
+  // ⚠ 必须排除 enabling：使能型声明兑现后也是 confirmed，但那是「依赖路径兑现」不是「布线」——
+  //   计入会让读数比实际新（**假活**），而这一面存在的理由正是抓假活。
+  //   同源纪律见 dsh-agent-self-rewrite/src/status.ts:186（两插件读同一个 self-test.json ⇒ 判据必须一致）。
+  let latestConfirmedAt: string | null = null
+  for (const h of hs) {
+    if (status(h) !== 'confirmed') continue
+    if ((h as { enabling?: unknown })?.enabling !== undefined) continue
+    const u = (h as { updatedAt?: unknown })?.updatedAt
+    if (typeof u !== 'string' || u.length === 0) continue
+    const t = Date.parse(u)
+    if (Number.isNaN(t)) continue
+    if (latestConfirmedAt === null || t > Date.parse(latestConfirmedAt)) latestConfirmedAt = u
+  }
+  return { ok: true, total: hs.length, active, finding, confirmed, refuted, activeWithEvidence, latestUpdatedAt, latestConfirmedAt }
 }
 
 /** emotion-state.json → {today,statsKeys,triggerCount,weights,emotions} */
@@ -211,8 +225,30 @@ export type RingKey = (typeof RINGS)[number]['key']
 
 export interface RingInput {
   selftest?: OrganSnapshot
-  /** 布线代理：最近布线动作距今天数（AGENTS.md/skills 最新 mtime），null=无记录 */
-  lastWireDays: number | null
+  /**
+   * **真源**：最新一条普通 confirmed 假设距今天数（自指引擎「裁决→布线」闭环最后合上）；`null` = 从未布线。
+   *
+   * 2026-10-18 换源（原为「技能目录 mtime」）。事故形状 = **Proxy Drift**（arXiv:2610.21646 §7）：
+   * 代理量（文件 mtime）**升**而真量（自指闭环）**停 27 天**，而门看不出——**无对手、无自指**，
+   * 纯粹因为「任何技能文件写入都让 mtime 变新」（同步镜像 / 改错别字 / 编辑技能全都算）。
+   * 论文原话：*"The gate cannot see the loss, because the loss lives beyond its time budget."*
+   */
+  lastConfirmedDays: number | null
+  /**
+   * **代理量**：技能目录最新 mtime 距今天数（「文件在动」≠「布线在推进」）。
+   * 只用于**背离检测**，不参与环状态判定——它正是那个会骗人的量。
+   */
+  fileActivityDays?: number | null
+  /** 布线环 green 阈值（天，默认 7）。2026-10-18 从 Config 接通（原「半死参数」，语义文档 U3）。 */
+  wireFreshDays?: number
+}
+
+/** 布线环阈值（天）：`fresh` green 线 · `staleAfter` 明显偏久 · `hardStale` 硬停摆 */
+export function wireThresholds(wireFreshDays?: number): { fresh: number; staleAfter: number; hardStale: number } {
+  const fresh = typeof wireFreshDays === 'number' && Number.isFinite(wireFreshDays) && wireFreshDays > 0 ? wireFreshDays : 7
+  const staleAfter = Math.max(fresh * 2, 14)
+  const hardStale = Math.max(staleAfter * 2, 30)
+  return { fresh, staleAfter, hardStale }
 }
 
 /** 五环判定（设计文档 §4.2 判定表） */
@@ -280,18 +316,31 @@ export function diagnoseRings(input: RingInput): { rings: RingState[]; broken: B
     broken.push({ ring: 'verdict', state: 'red', signal: 'confirmed+refuted = 0', suggestion: '先让假设跑出 finding，再走第一次裁决' })
   }
 
-  // ⑤ 布线：lastWireDays ≤7 green / ≤30 yellow / null 或 >30 red
-  const wireDays = input.lastWireDays ?? null
+  // ⑤ 布线：**真源 = 自指闭环**（最新普通 confirmed），代理量（文件 mtime）只做背离检测。
+  //    见 RingInput.lastConfirmedDays 头注（Proxy Drift 事故 + 论文依据）。
+  const { fresh, staleAfter, hardStale } = wireThresholds(input.wireFreshDays)
+  const wireDays = input.lastConfirmedDays ?? null
+  const fileDays = input.fileActivityDays ?? null
+  // 背离：文件在动（≤fresh）而闭环停在 staleAfter 之外 ⇒ **代理量正在掩盖真量**
+  const drift = wireDays !== null && wireDays > staleAfter && fileDays !== null && fileDays <= fresh
   if (wireDays === null) {
-    rings.push({ name: 'wire', label: '布线', state: 'red', detail: '无布线记录（AGENTS.md/skills 未见近期更新）' })
-    broken.push({ ring: 'wire', state: 'red', signal: '无布线记录', suggestion: '把近期经验炼化成技能/规则（skill_commit / 编辑 AGENTS.md）并 evolution_log(type=wire)' })
-  } else if (wireDays <= 7) {
-    rings.push({ name: 'wire', label: '布线', state: 'green', detail: `最近布线 ${wireDays} 天前` })
-  } else if (wireDays <= 30) {
-    rings.push({ name: 'wire', label: '布线', state: 'yellow', detail: `最近布线 ${wireDays} 天前（偏久）` })
+    rings.push({ name: 'wire', label: '布线', state: 'red', detail: '自指引擎从未裁决布线（无普通 confirmed 假设）' })
+    broken.push({ ring: 'wire', state: 'red', signal: '无布线记录（普通 confirmed = 0）', suggestion: '让一条猜想跑出 finding 后走 rewrite_verdict(confirm)——⚠ 使能型声明（enabling）兑现不算布线' })
+  } else if (wireDays <= fresh) {
+    rings.push({ name: 'wire', label: '布线', state: 'green', detail: `自指闭环 ${wireDays} 天前合上` })
+  } else if (wireDays <= staleAfter) {
+    rings.push({ name: 'wire', label: '布线', state: 'yellow', detail: `自指闭环 ${wireDays} 天前合上（偏久）` })
+  } else if (drift) {
+    rings.push({ name: 'wire', label: '布线', state: 'red',
+      detail: `自指闭环停 ${wireDays} 天，而技能文件 ${fileDays} 天前还在动——**代理量背离**（文件活动 ≠ 布线推进）` })
+    broken.push({ ring: 'wire', state: 'red',
+      signal: `代理量背离：fileActivity=${fileDays}d（≤${fresh} 新鲜）而 lastConfirmed=${wireDays}d（>${staleAfter}）`,
+      suggestion: '这正是 Proxy Drift 的形状——文件在动让人以为在布线。查 rewrite_status 停滞读数（在采证 0 条 ⇒ 采证链断）后推进，或**明确记录本季收敛**（无意识停摆 ≠ 有意识收敛）' })
+  } else if (wireDays > hardStale) {
+    rings.push({ name: 'wire', label: '布线', state: 'red', detail: `${wireDays} 天无裁决布线（自指闭环停摆）` })
+    broken.push({ ring: 'wire', state: 'red', signal: `lastConfirmed ${wireDays} 天（>${hardStale}）`, suggestion: '查 rewrite_status 停滞读数并推进：开一条新猜想 / 给在采证假设补证据 / 明确记录收敛' })
   } else {
-    rings.push({ name: 'wire', label: '布线', state: 'red', detail: `${wireDays} 天无布线动作` })
-    broken.push({ ring: 'wire', state: 'red', signal: `${wireDays} 天无布线`, suggestion: '把近期经验炼化成技能/规则并 evolution_log(type=wire)' })
+    rings.push({ name: 'wire', label: '布线', state: 'yellow', detail: `自指闭环 ${wireDays} 天前合上（偏久，文件活动未掩盖：${fileDays ?? '?'} 天前）` })
   }
 
   return { rings, broken }
@@ -303,7 +352,11 @@ export interface SuggestionInput {
   selftest?: OrganSnapshot
   evolve?: OrganSnapshot
   checkpoints?: OrganSnapshot
-  lastWireDays: number | null
+  /** 真源：自指闭环最后合上距今天数（见 RingInput.lastConfirmedDays） */
+  lastConfirmedDays: number | null
+  /** 代理量：技能目录最新 mtime 距今天数（只做背离提示） */
+  fileActivityDays?: number | null
+  wireFreshDays?: number
 }
 
 /** 生成行动建议（优先级排序，来自设计 §5.1 规则 1-7） */
@@ -348,9 +401,19 @@ export function buildSuggestions(input: SuggestionInput): string[] {
     out.push('【采证】有 active 假设但证据 0：检查探针配置是否合理（tool 名/阈值/窗口），或确认行为确实未触发')
   }
 
-  const wireDays = input.lastWireDays ?? null
-  if (wireDays !== null && wireDays > 7) {
-    out.push(`【布线】${wireDays} 天无布线动作：把近期经验炼化成技能/规则（skill_commit 或编辑 AGENTS.md），完成后 evolution_log(type=wire)`)
+  // 布线建议（2026-10-18 换源）：**旧文案是 Goodhart 的帮凶**——它说「把经验炼化成技能/规则」，
+  // 而环的旧判据是技能目录 mtime ⇒ 照做即可让环变绿，**而自指闭环一步没动**。
+  // 新文案只指向真源（闭环），且显式点出代理量背离。
+  const wireDays = input.lastConfirmedDays ?? null
+  const { fresh: wireFresh } = wireThresholds(input.wireFreshDays)
+  const fileDays = input.fileActivityDays ?? null
+  if (wireDays === null) {
+    out.push('【布线】自指引擎从未裁决布线（普通 confirmed = 0）：让一条猜想跑出 finding 后走 rewrite_verdict(confirm)')
+  } else if (wireDays > wireFresh) {
+    const drift = wireDays > wireFresh * 2 && fileDays !== null && fileDays <= wireFresh
+    out.push(`【布线】自指闭环 ${wireDays} 天未合上（阈值 ${wireFresh} 天）` +
+      (drift ? `；⚠ 而技能文件 ${fileDays} 天前还在动——**代理量背离**（Proxy Drift：文件活动 ≠ 布线推进）` : '') +
+      '：查 rewrite_status 停滞读数（在采证 0 条 ⇒ 采证链断）后推进，或**明确记录本季收敛**（无意识停摆 ≠ 有意识收敛）')
   }
 
   const cpAge = cp?.ok === true ? (cp?.latestAgeDays as number | null | undefined) : null

@@ -30,7 +30,8 @@
 | 器官快照 `OrganSnapshot` | `{ ok: boolean, [k]: unknown }`；`ok:false` = **数据源不可读**（缺失/坏 JSON），不是「值为空」。取值用 `num()`：非有限数一律按 `0`（core.ts:59，脏数据保守为红） |
 | 五环 | 猜想 `hypothesize` → 采证 `evidence` → finding → 裁决 `verdict` → 布线 `wire`（自指闭环，AGENTS.md §5.7） |
 | 环状态 / 断点 | `green`/`yellow`/`red`/`unknown`（渲染 🟢🟡🔴⚪）；环判 `red` 时输出一条 `{ring,state,signal,suggestion}` = 断点 |
-| 布线信号（wire proxy） | 技能目录最新 mtime 折算的「距今天数」——**代理量，非真实布线事件**（`readWireSignal` index.ts:202） |
+| 布线**真源** | 最新一条**普通** `confirmed` 假设的 `updatedAt`（**排除 `enabling`**）折算的「距今天数」= 自指闭环最后合上时刻（`summarizeSelftest.latestConfirmedAt` → `daysBetween`）。与 `dsh-agent-self-rewrite` **读同一个 `self-test.json`**，判据同源（status.ts:186） |
+| 布线**代理量** | 技能目录最新 mtime 折算的「距今天数」——**文件活动 ≠ 布线推进**；只用于**背离检测**（`readFileActivity` index.ts:202） |
 | 履历 / 回流 | `history.jsonl`（一行一事件 `{id,ts,type,detail,ref}`，本插件**唯一自持写入产物**）；`cycle`/`log` 同时调 `memoryApi.remember`（`kind:'episodic'`、`key:'evolve-history-<id>'`）回流主记忆库，失败**静默** |
 
 ## 3 · 概念模型
@@ -38,10 +39,11 @@
 ```
 DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读源（readJson/index.ts:105；失败 → null → {ok:false}）：
   self-test.json｜emotion-state.json｜reflection-state.json｜life-core/state.json｜storages/agent_memory.json
-  checkpoints/（子目录名）｜skills + ~/.agents/skills 最新 mtime｜<DSH_HOME 上级>/.evolve/ledger.json（可 config 覆盖）
+  checkpoints/（子目录名）｜skills + ~/.agents/skills 最新 mtime（**代理量**）｜<DSH_HOME 上级>/.evolve/ledger.json（可 config 覆盖）
       ▼ aggregate(config) index.ts:216 ─ core.ts summarize*（7 纯函数）→ OrganSnapshot
-   ├─ diagnoseRings({selftest,lastWireDays}) → {rings,broken}（布线环靠 skills mtime 折算，递归 depth≤2）
-   └─ buildSuggestions({selftest,evolve,checkpoints,lastWireDays})   ▼ 四个出口
+   ├─ diagnoseRings({selftest,lastConfirmedDays,fileActivityDays,wireFreshDays}) → {rings,broken}
+   │    （布线环判据 = **真源** lastConfirmedDays；fileActivityDays 只喂背离检测；skills mtime 递归 depth≤2）
+   └─ buildSuggestions({selftest,evolve,checkpoints,lastConfirmedDays,fileActivityDays,wireFreshDays})   ▼ 四个出口
  ① evolution_status 全量快照（不写盘）   ② evolution_cycle 快照 + appendHistory('cycle') + 回流
  ③ evolution_history 只读 history.jsonl  ④ ctx.evolutionCore.snapshot() → dsh-life-core 感知圈
 ```
@@ -61,7 +63,7 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 | `enabled` | `boolean`，默认 `true` | 关闭后工具 fail-soft，服务返回 `null` |
 | `dataDir` | `string?`，默认 `$DSH_HOME/evolution-core` | 履历目录；`history.jsonl` = `<dataDir>/history.jsonl` |
 | `evolveLedgerPath` | `string?`，默认 `<DSH_HOME 上级>/.evolve/ledger.json` | ⚠ 默认值在 DSH_HOME **之外**（本机 = `E:\alice\.evolve\ledger.json`） |
-| `wireSignalDirs` / `wireFreshDays` | `string[]?` 默认无 / `number` 默认 `7` | 前者追加布线信号目录（不存在则跳过）；后者**半死**：只进 ready 日志（index.ts:498），阈值硬编码 core.ts:280/282（§8） |
+| `wireSignalDirs` / `wireFreshDays` | `string[]?` 默认无 / `number` 默认 `7` | 前者追加**文件活动**目录（代理量，不存在则跳过）；后者**已生效**（2026-10-18 接通 `core.wireThresholds`）：真源 ≤ 此值 = green，明显偏久线 = `max(2×fresh, 14)`，硬停摆线 = `max(2×偏久, 30)` |
 | 落盘产物 | `history.jsonl`：一行一事件 `{id,ts,type,detail,ref}`，`id=e-<base36 ms>-<自增>`；追加写 + 损坏行读取跳过（torn tail 容错） | 事件类型 8 值：`cycle`/`verdict`/`forge`/`evolve`/`wire`/`reflect`/`checkpoint`/`note`（`evolution_log` 的 enum 校验） |
 
 ### 4.2 状态→裁决表（纯函数，core.ts）
@@ -72,8 +74,8 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 | `active > 0 且 activeWithEvidence` / `active > 0 无证据` / `active = 0 且库中有终态` / `active = 0 且库全空` | 采证环 green / yellow / **yellow「空窗」** / red+断点 | core.ts `diagnoseRings`②（同上） |
 | `finding = 0` / `≥ 1` | finding 环 green / red+断点（积压即红） | core.ts:256-261 |
 | `confirmed + refuted ≥ 5` / `1–4` / `0` | 裁决环 green / yellow / red+断点 | core.ts:266-273 |
-| 布线 `≤ 7` / `≤ 30` / `null 或 > 30` 天 | 布线环 green / yellow / red+断点 | core.ts:276-287 |
-| 建议排序 | 不可读器官 → finding 积压 → evolve 闲置（>14 红 / >7 黄）→ 猜想/采证 → 布线（>7）→ 存档（>3）→ 兜底「五环健康」 | core.ts:302-349 |
+| 布线环（**真源** `lastConfirmedDays`）：`null` / `≤fresh` / `≤偏久` / `>偏久` **且代理量背离** / `>硬停摆` / 其余 | red+断点 / green / yellow / **red+断点（Proxy Drift）** / red+断点 / yellow | `core.ts` `diagnoseRings`⑤ + `wireThresholds`（2026-10-18 换源，原为 skills mtime） |
+| 建议排序 | 不可读器官 → finding 积压 → evolve 闲置（>14 红 / >7 黄）→ 猜想/采证 → 布线（>fresh；背离时**加警告**）→ 存档（>3）→ 兜底「五环健康」 | `core.ts` `buildSuggestions` |
 | `evolution_history` 的 `days` | `clampDays`：缺省 30，收敛到 `[1, 3650]` | format.ts:44 |
 | 呈现层的**空值边界（2026-09-14 自持）** | `renderOrganLine(key, null/undefined)` → `${key}: ⚠不可读`（与 `ok !== true` 同口径，文案与 `aggregateSnapshot` 原兜底串逐字相同）；`hasRedRing(null/undefined/非数组)` → `false`（读不出的环项按非红处理——不谎报红环，真红仍被看见） | format.ts（函数内自持，调用点判空降为纵深防御） |
 
@@ -92,8 +94,8 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 | 消费方（服务） | `dsh-life-core/src/index.ts:32` inject 含 `evolutionCore`；`:88` `ctx.evolutionCore` 取用；`activate.ts:80` 注入闭包 | life-core 感知圈到期时 |
 | 落盘（履历） | `src/history-store.ts:49` `appendHistory(dataDir,…)` → `historyPath()`；调用点 `index.ts:383`(cycle) / `:430`(log) | 每次 cycle / log |
 | 回流（记忆） | `src/index.ts:250` `refluxEvent()` → `ctx.memoryApi.remember()`；调用点 `:384` / `:432` | 每次 cycle / log |
-| 器官只读入口 | `src/index.ts:166–199` `readSelftest/readEmotion/readReflection/readLifeCore/readEvolve/readMemory/readCheckpoints`；`:202` `readWireSignal` | 每次 aggregate |
-| 测试 | `tests/core.test.mjs`（`node --test`，import `../lib/core.js`，37 个用例；package.json script `test` = `node --test "tests/*.test.mjs"`） | 手动/回归 |
+| 器官只读入口 | `src/index.ts` `readSelftest/readEmotion/readReflection/readLifeCore/readEvolve/readMemory/readCheckpoints`；`readFileActivity`（**代理量**，非判据） | 每次 aggregate |
+| 测试 | `tests/*.test.mjs`（`node --test`，import `../lib/*.js`，**66 个用例**：含 Proxy Drift 尸体样本 + 对照组 + 恢复样本 + 阈值参数化；package.json script `test` = `node --test "tests/*.test.mjs"`） | 手动/回归 |
 
 ## 5 · 边界与信任
 
@@ -137,12 +139,23 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
   - **构建滞后已消除，但「未生效」与教训保留**：`lib/` 曾仅 `index.js`/`core.js`（均 09-07 14:26），落后源码约三天；并行实例已于 **09-14 10:30:36** 重建（8 文件，含 `format.js`/`history-store.js`，晚于 src 10:24:55）——**但 web 进程启动于 10:05:47，早于产物 mtime ⇒ 线上仍在跑 09-07 旧构建**（旧构建自洽；新源码能力须重启才生效）。教训：mtime 只证明「构建过」，生效判据必须含**进程启动时刻**（§5.11 §6）。
   - **测试只覆盖一半**：`tests/core.test.mjs` 只 import `../lib/core.js`；`format.ts`/`history-store.ts`/`index.ts`（工具面、服务、回流、参数校验）**无测试** ⇒ A5–A8 只能线上取证。
   - **死 import**：`src/index.ts:31` 导入的 `writeFileSync` 与 `appendFileSync` 在 `index.ts` 内**均未使用**（写操作已抽到 `history-store.ts`）；`tsconfig.json` 未开 `noUnusedLocals`，tsc 不报。
-  - **`wireFreshDays` 半死**：`Config` 有该字段（默认 7）但只出现在 ready 日志（index.ts:498）；布线环 7/30 天阈值在 `core.ts:280/282` 硬编码——改配置不改判定，与 README 表述不符。
+  - ~~**`wireFreshDays` 半死**~~ → **2026-10-18 已修**：原 `Config` 有该字段（默认 7）却只出现在 ready 日志、阈值硬编码在 `core.ts` ⇒ 改配置不改判定。现经 `core.wireThresholds(wireFreshDays)` 接通（真源 ≤ `fresh` = green；偏久线 `max(2×fresh, 14)`；硬停摆线 `max(2×偏久, 30)`），并有参数化单测锁定（`=3` ⇒ 5 天即黄 / `=20` ⇒ 5 天仍绿）。
   - **`inject` 与「可选」措辞冲突**：index.ts:44 注释称 `memoryApi` 为「可选回流服务」，index.ts:45 却写进 `inject`（cordis 激活门：服务缺失则本插件不激活）；实现侧访问走 `(ctx as unknown as {memoryApi?})` 软容错（index.ts:252 判 `undefined` 即 return）——声明硬 + 实现软，语义未定（§10 U2）。
   - **README 与源码不一致**：README 称聚合含「skill-forge」，源码 7 个读取器中无 skill-forge（`evolution_status` 的 7 器官表述与源码一致）。
   - **并行改造中（含未核实项）**：`src/format.ts`、`src/history-store.ts`、`tests/`、`package.json` 由**另一并行实例**于 09-14 10:24–10:26 引入/改动且未提交（`git status`：`M src/index.ts` / `M package.json` / `?? src/format.ts` / `?? src/history-store.ts` / `?? tests/`）——本文行号以 `src/*.ts` @ 2026-09-14 10:24 为快照，可能随后续改造漂移；旧构建（09-07 `lib/index.js`）与当前源码的**逐行行为差异面未核实**。
 
 ## 9 · 实践修订记录
+
+- **2026-10-18 布线环换真源：代理量（skills mtime）→ 自指闭环（普通 confirmed）+ Proxy Drift 背离检测（任务 `t-090054bb`）**
+  - **触发缺口（当晚真实读数：同一时刻两个互相矛盾的数）**：`evolution_cycle` 报 `🟡🟡🟢🟢🟢 五环健康`，而 `rewrite_status` 报「**最后布线 27 天前**（2026-09-20）+ 在采证 0 条」。**根因**：布线环判据是技能目录 mtime —— **任何技能文件写入都让它变绿**（同步镜像 / 改错别字 / 编辑技能全都算），而真正的「裁决→布线」闭环可以停 27 天。⚠ 本文件 **2026-09-14 的 U5 已登记此问题，挂了 34 天无人动** ⇒ 缺的不是「记下来」，是**推进面判据**。
+  - **理论（arXiv:2610.21646 §7 Proxy Drift）**：*"The gate cannot see the loss, because the loss lives beyond its time budget."* —— 代理量升而真量降，**门仍 sound**：**无对手、无自指**，纯粹是「判据只看它看得见的部分」。修法原话：*"hold the per-round budget fixed for speed, and re-evaluate with a larger budget from time to time."*
+  - **换源（零新增依赖）**：`dsh-agent-self-rewrite/src/store.ts:35` 与 `readSelftest` **读同一个 `$DSH_HOME/agent-self-test/self-test.json`** ⇒ 真源取新增的 `summarizeSelftest.latestConfirmedAt`，**排除 `enabling`**（使能型声明兑现 ≠ 布线，计入即假活 —— 同源纪律 `status.ts:186`）。
+  - **判定表**：`null` ⇒ red+断点 / `≤fresh` ⇒ green / `≤偏久` ⇒ yellow / `>偏久` **且文件活动 ≤fresh（背离）** ⇒ **red+断点** / `>硬停摆` ⇒ red+断点 / 其余 ⇒ yellow。代理量**只喂背离检测，不参与环状态**。
+  - **建议文案同修**：旧文案（「把近期经验炼化成技能/规则」）**是 Goodhart 的帮凶**——照做即让旧环变绿而闭环没动；新文案只指向真源，背离时显式点名。
+  - **标定（金标准 + 尸体）**：临时 `drift = false` ⇒ **恰好 1 红**（那条 Proxy Drift 尸体样本）⇒ 判据有区分力；改回 ⇒ **66/66 全绿**。含**对照组**（同样 27 天但文件也静 ⇒ 黄 ⇒ 证明测的是「背离」不是「27 天」）与**恢复样本**（3 天 ⇒ 绿 ⇒ 证明非恒红）。
+  - **线上复核**：预检通过 → 重启（进程启动 `1792296472704`，`live 73｜需重启 0`）→ 实调 `evolution_cycle` ⇒ `🟡🟡🟢🟢🔴` + 「⚠ 有红环断点」+ 建议逐字报出「自指闭环 27 天未合上…而技能文件 0 天前还在动——**代理量背离**」✓（**同一判据、同一数据，从 🟢 变 🔴**）。
+  - **未线上验证（如实标注）**：恢复路径（真去 confirm 一条假设）**只由单测覆盖**，未做线上注入（不伪造裁决换取绿灯）。
+  - 教训：① **代理量最危险的不是它会错，而是它会绿**——它让「文件在动」冒充「循环在转」，且**无对手**（没人骗它）；② 判据换源时**先查同源**（两插件读同一个 JSON ⇒ 判据必须一致，否则两处读数各自漂移）；③ **U5 挂 34 天**说明「登记缺口」本身不是推进力——**推进面判据**才是（本次改动补的正是这个，自指）。
 
 - **2026-09-21 判定表补「空窗」分支：收敛不再被误报成断点（`active == 0` 的多态化）**
   - **触发缺口**：`active == 0` 一律判 `red + 断点`，于是**收敛（该淘汰的都淘汰了）被读成"缺猜想"**，每圈催一句「selftest_add 一条」——红灯的含义被压成单一计数，区分不了「断点」与「收敛」，属**指标分辨力不足**（告警疲劳 + 诱导"为点灯而造假设"）。
@@ -164,6 +177,6 @@ DSH_HOME = process.env.DSH_HOME || ~/.dsh（本机 E:\alice\.dsh）——只读�
 
 - **U1 死引用清理**：`docs/design/evolution-core-design.md` 被 3 处引用却不存在——补写设计文档，还是把引用改指本文？倾向**改指本文**（避免两份平行语义，I1）。
 - **U2 `memoryApi` 硬依赖还是软依赖**：`inject` 声明为硬（激活门），实现为软（判 `undefined` 跳过回流）。软则改 `ctx.get('memoryApi')` 且移出 `inject`；硬则删注释与容错分支。需裁决并一次性收敛（涉及与 `dsh-agent-memory` 的挂载顺序）。
-- **U3 `wireFreshDays` 归属**：参数化 `core.ts` 的 7/30 阈值（环判定接受入参 + 补单测），还是从 `Config` 移除？现状「配置存在但不生效」是最差路径。
-- **U4 重建已做、重启未做的收口**：`lib/` 已重建（09-14 10:30:36，8 文件）但 web 进程（10:05:47 启动）尚未加载 ⇒ 何时重启生效，是否由正在改造的**该实例**收口时统一走哨兵（§5.11 进程级判据 + §5.14 不重复劳动）？
-- **U5 布线环代理量可靠性**：`skills` 目录 mtime 会把「任何技能文件触碰」都算成布线——是否改为「履历 `evolution_log(type:'wire')` 优先、mtime 兜底」的双判据？
+- ~~**U3 `wireFreshDays` 归属**~~ → **2026-10-18 已闭合**：选「参数化」路（`core.wireThresholds` 接受入参 + 参数化单测锁定），配置项保留且**真生效**。
+- ~~**U4 重建已做、重启未做的收口**~~ → **已闭合（陈旧）**：09-14 那次重建早已随后续多次哨兵重启生效；本条目是当时快照，判据（进程启动时刻 vs 产物 mtime）已常态化为 `plugin_boot_status`。
+- ~~**U5 布线环代理量可靠性**~~ → **2026-10-18 已闭合**：真源改为**自指闭环**（普通 `confirmed`）——比 U5 原拟的「`evolution_log(type:'wire')` 优先」更准：wire 事件是**跨域**布线声明（论文迁移 / 技能炼化），而五环第五环测的是**自指引擎自身的闭环**（两者 2026-10-18 实测差 27 天 vs 7 小时）；mtime 降级为**背离检测**输入（文件在动 ∧ 闭环停着 ⇒ 报 Proxy Drift）。
