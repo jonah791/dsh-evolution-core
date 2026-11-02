@@ -51,9 +51,48 @@ export interface HistoryEvent {
    * 只有 evidence 没有 delta 也是合法的（有些改动只能证明存在，不能证明幅度）。
    */
   delta?: string
+  /**
+   * 可复用组件清单（2026-11-03 新增，`type=verdict` 时**必填**）。
+   *
+   * 存在理由（t-d9d60529）：我的裁决是**整体裁决**——一个「整体不适配」的产物里，
+   * 有用的组件会随它一起被归档。实例：DKGI 两场景均不适配 ⇒ 整条归档，但它产出了一条
+   * 新判据「痛点存在 ≠ 痛点有代价」，那正是被整体分掩盖的组件。
+   * 形状 = 每项「类型:一句话」（类型 ∈ 判据/工具/教训/方法/判据修正…）；没有可复用组件
+   * 写 `["none"]`——**显式写 none 与忘了写，在数据上必须可区分**。
+   * 旧记录没有本字段是合法的（读侧按缺失处理，不做迁移）。
+   */
+  salvage?: readonly string[]
 }
 
 // ---------- 工具函数 ----------
+
+/**
+ * 归一化可复用组件清单：转字符串、去空白、丢空项。非数组一律视为空。
+ * @param salvage - 原始输入（可能来自工具参数，可能是 undefined）。
+ * @returns 清理后的组件列表；空列表 = 没给。
+ */
+export function normalizeSalvage(salvage: unknown): string[] {
+  return (Array.isArray(salvage) ? salvage : [])
+    .map((s) => String(s).trim())
+    .filter((s) => s !== '')
+}
+
+/**
+ * 裁决的「可复用组件」准入（fail-closed，判断型字段禁默认值）。
+ *
+ * `type="verdict"` 时必须显式回答「这次裁决里有什么可以带走」：给出清单，或写 `["none"]`。
+ * 不设默认值——默认值会让「没想过」与「想过、没有」在数据上同形，而 t-d9d60529 的缺口
+ * （整体裁决把有用组件一起埋掉）正是这样形成的。
+ * @param type - 动作类型。
+ * @param salvage - 原始输入。
+ * @returns 错误文案；通过返回 null。
+ */
+export function validateSalvage(type: string, salvage: unknown): string | null {
+  if (type !== 'verdict') return null
+  if (normalizeSalvage(salvage).length > 0) return null
+  return 'type="verdict" 必须带 salvage：列出这次裁决里可复用的组件（每项「类型:一句话」，类型 ∈ 判据/工具/教训/方法），'
+    + '确实没有可带走的就写 ["none"]。理由：整体裁决会把「整体不适配、但产出有用组件」的东西连组件一起埋掉（t-d9d60529）。'
+}
 
 /** 本地日期 YYYY-MM-DD（中国时区 UTC+8 语义，用本地时间） */
 export function localDay(d: Date): string {

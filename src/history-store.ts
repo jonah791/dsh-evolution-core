@@ -48,13 +48,17 @@ export function nextHistoryId(nowMs: number): string {
  */
 export function appendHistory(
   dataDir: string,
-  ev: { type: string; detail?: string; ref?: string | null; evidence?: string; delta?: string },
+  ev: { type: string; detail?: string; ref?: string | null; evidence?: string; delta?: string; salvage?: readonly string[] },
   now: Date = new Date(),
 ): { id: string; ts: string; evidence?: string } | null {
   try {
     mkdirSync(dataDir, { recursive: true })
     const evidence = typeof ev.evidence === 'string' && ev.evidence.trim() !== '' ? ev.evidence.trim() : undefined
     const delta = typeof ev.delta === 'string' && ev.delta.trim() !== '' ? ev.delta.trim() : undefined
+    // 碎片清理：去空白、丢空项。全空 ⇒ 不入盘（与 evidence/delta 同口径：没有就是字段不存在）。
+    const salvage = Array.isArray(ev.salvage)
+      ? ev.salvage.map((s) => String(s).trim()).filter((s) => s !== '')
+      : []
     const full: HistoryEvent = {
       id: nextHistoryId(now.getTime()),
       ts: now.toISOString(),
@@ -65,6 +69,7 @@ export function appendHistory(
       // 两者在 JSON 里都是 undefined，但写入时保留空串会让下游误以为「填过了」。
       ...(evidence === undefined ? {} : { evidence }),
       ...(delta === undefined ? {} : { delta }),
+      ...(salvage.length === 0 ? {} : { salvage }),
     }
     appendFileSync(historyPath(dataDir), JSON.stringify(full) + '\n', 'utf-8')
     return { id: full.id, ts: full.ts, evidence }

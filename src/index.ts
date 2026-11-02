@@ -37,6 +37,7 @@ import {
   summarizeEvolve, summarizeMemory, summarizeCheckpoints,
   diagnoseRings, buildSuggestions, computeHistoryStats, buildSummary, daysBetween,
   computeProgress, renderProgressLine, NEEDS_EVIDENCE, ADVANCE_TYPES,
+  normalizeSalvage, validateSalvage,
 } from './core.ts'
 import type { OrganSnapshot, ProgressSnapshot } from './core.ts'
 import { TYPE_LABEL, renderOrganLine, ringMark, clampDays, hasRedRing } from './format.ts'
@@ -553,13 +554,21 @@ export function apply(ctx: Context, config: Config): void {
     name: 'evolution_log',
     description: '进化核心·留痕：把一次进化动作（verdict 裁决 / forge 炼化 / evolve 评测轮 / wire 布线 / reflect 每日反思 / checkpoint 存档 / cycle 感知圈 / note 备注）记入进化履历（history.jsonl）。'
       + '⚠ 只有 verdict / forge / wire / evolve / reflect 算**推进**（改了东西）；cycle（我来过）、note（备注）、checkpoint（保存现场）不算。'
-      + 'verdict / forge / wire **必须带 evidence 证据指针**（path:line / 记忆 id / 技能名 / 提交号），否则这条记为「未入账」并计入连续无证据数——采纳 ≠ 有效。',
+      + 'verdict / forge / wire **必须带 evidence 证据指针**（path:line / 记忆 id / 技能名 / 提交号），否则这条记为「未入账」并计入连续无证据数——采纳 ≠ 有效。'
+      + '⚠ `type="verdict"` 还**必须**带 `salvage`：这次裁决里**可复用的组件**（判据 / 工具 / 教训 / 方法，每项写成「类型:一句话」）；确实没有可带走的就写 `["none"]`。'
+      + '存在理由：整体裁决会把「整体不适配、但产出了有用组件」的东西连组件一起埋掉（t-d9d60529 · DKGI 归档时那条新判据就是这么丢的）。',
     parameters: {
       type: { type: 'string', required: true, enum: ['cycle', 'verdict', 'forge', 'evolve', 'wire', 'reflect', 'checkpoint', 'note'], description: '动作类型' },
       detail: { type: 'string', description: '一句话说明' },
       ref: { type: 'string', description: '关联 id（如假设 id/技能名）' },
       evidence: { type: 'string', description: '证据指针：这次推进凭什么说它改变了东西（path:line / 记忆 id / 技能名 / 提交号 / 工具名）。verdict / forge / wire 必填才算入账。' },
       delta: { type: 'string', description: '改前/改后读数差（可选，如「dst 27→11 页」「命中率 0.42→0.61」）。与 evidence 分工：evidence 指去哪看，delta 指变了多少。' },
+      salvage: {
+        type: 'array',
+        items: { type: 'string' },
+        description: '可复用组件清单（type="verdict" 时必填）：每项「类型:一句话」，类型 ∈ 判据 / 工具 / 教训 / 方法 / 判据修正。没有可带走的写 ["none"]——'
+          + '显式写 none 与忘了写必须可区分，所以不给默认值（判断型字段禁默认值）。',
+      },
     },
     output: {
       schema: {
@@ -574,12 +583,19 @@ export function apply(ctx: Context, config: Config): void {
           evidence: { type: 'string' },
           needsEvidence: { type: 'boolean' },
           isAdvance: { type: 'boolean' },
+          salvagedCount: { type: 'number' },
+          salvageIsNone: { type: 'boolean' },
         },
       },
       render: (_a: unknown, v: any) => {
         if (v.ok !== true) return [{ type: 'text', text: `记录失败：${String(v.error ?? '')}` }]
         const label = TYPE_LABEL[v.type] ?? v.type
         let text = `已记录进化动作（${label}）[${v.id}]`
+        if (typeof v.salvagedCount === 'number' && v.salvagedCount > 0) {
+          text += v.salvageIsNone === true
+            ? '\n· 可复用组件：显式 none（本次确实没有可带走的）'
+            : `\n· 可复用组件 ${String(v.salvagedCount)} 条（已落 history.jsonl 的 salvage 字段，可用 evolution_history 检索）`
+        }
         if (v.isAdvance !== true) {
           text += '\n（此行不计入「推进」——cycle/note/checkpoint 是「我来过 / 备注 / 保存」，不是「我改变了什么」）'
         } else if (v.needsEvidence === true && !v.evidence) {
@@ -588,11 +604,16 @@ export function apply(ctx: Context, config: Config): void {
         return [{ type: 'text', text }]
       },
     },
-    async execute(args: { type: string; detail?: string; ref?: string; evidence?: string; delta?: string }) {
+    async execute(args: { type: string; detail?: string; ref?: string; evidence?: string; delta?: string; salvage?: string[] }) {
       if (!config.enabled) return { ok: false, error: 'evolution-core disabled' }
-      const ev = appendHistory(dataDir, { type: args.type, detail: args.detail ?? '', ref: args.ref ?? null, evidence: args.evidence, delta: args.delta })
+      const salvage = normalizeSalvage(args.salvage)
+      // fail-closed：裁决必须显式回答「有没有可带走的组件」。判据在 core.validateSalvage
+      // （纯函数、单测覆盖），工具这里只做准入——别在两处各写一套判据。
+      const salvageError = validateSalvage(args.type, args.salvage)
+      if (salvageError !== null) return { ok: false, error: salvageError }
+      const ev = appendHistory(dataDir, { type: args.type, detail: args.detail ?? '', ref: args.ref ?? null, evidence: args.evidence, delta: args.delta, salvage })
       if (ev === null) return { ok: false, error: 'history.jsonl 写入失败' }
-      refluxEvent({ type: args.type, detail: (args.detail ?? '') + (args.evidence ? ' · 证据 ' + args.evidence : ''), id: ev.id })
+      refluxEvent({ type: args.type, detail: (args.detail ?? '') + (args.evidence ? ' · 证据 ' + args.evidence : '') + (salvage.length > 0 ? ` · 可复用 ${String(salvage.length)} 条` : ''), id: ev.id })
       return {
         ok: true,
         type: args.type,
@@ -604,6 +625,8 @@ export function apply(ctx: Context, config: Config): void {
         ...(ev.evidence === undefined ? {} : { evidence: ev.evidence }),
         needsEvidence: NEEDS_EVIDENCE.has(args.type),
         isAdvance: ADVANCE_TYPES.has(args.type),
+        salvagedCount: salvage.length,
+        salvageIsNone: salvage.length === 1 && salvage[0] === 'none',
       }
     },
   }))
@@ -635,7 +658,11 @@ export function apply(ctx: Context, config: Config): void {
         const lines = recents.map((e: any) => {
           const label = TYPE_LABEL[e.type] ?? e.type
           const d = e.detail ? ' ' + e.detail : ''
-          return `  ${String(e.ts).slice(0, 16)} [${label}]${d}`
+          // 可复用组件要出现在履历正文里：只存进 JSON 而读不到，等于又埋了一次（t-d9d60529）。
+          const sv = Array.isArray(e.salvage) && e.salvage.length > 0
+            ? '\n     ↳ 可复用: ' + e.salvage.map((x: unknown) => String(x)).join(' | ')
+            : ''
+          return `  ${String(e.ts).slice(0, 16)} [${label}]${d}${sv}`
         })
         const byTypeStr = Object.entries(v.byType ?? {})
           .map(([t, c]) => `${TYPE_LABEL[t] ?? t}:${c}`)
