@@ -423,6 +423,7 @@ export function apply(ctx: Context, config: Config): void {
           evolveIdleDays: { type: 'number' },
           progress: { type: 'json' },
           progressLine: { type: 'string' },
+          error: { type: 'string' },
         },
       },
       render: (_a: unknown, v: any) => {
@@ -483,6 +484,7 @@ export function apply(ctx: Context, config: Config): void {
           logged: { type: 'boolean' },
           progress: { type: 'json' },
           progressLine: { type: 'string' },
+          error: { type: 'string' },
           advanceRequired: { type: 'boolean' },
         },
       },
@@ -622,6 +624,7 @@ export function apply(ctx: Context, config: Config): void {
           byType: { type: 'json' },
           recent: { type: 'json' },
           summary: { type: 'string' },
+          error: { type: 'string' },
         },
       },
       render: (_a: unknown, v: any) => {

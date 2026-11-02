@@ -252,6 +252,41 @@ test('★ 尸体·Proxy Drift：文件在动而自指闭环停摆 ⇒ 红 + 背�
   assert.deepEqual(ctrl.broken, [])
 })
 
+// ★ 收敛声明（2026-10-31 · t-8df40786）：把「有意识收敛」与「无意识停摆」分开。
+//   病：布线环真源只认普通 confirmed ⇒ 要么为点亮环开一条不该开的假设（Goodhart），
+//   要么长期红灯 ⇒ 告警疲劳。同型先例 = 2026-09-21 猜想环的「空窗」多态化。
+//   修法：显式声明 ∧ 无 active 猜想 ∧ 无 finding 积压 ⇒ yellow「已声明收敛」，不进 broken。
+test('★ 收敛声明：无声明仍红（尸体）/ 有声明转黄不进断点 / 有 active 或 finding 时不许收敛', () => {
+  // ① 尸体：27 天无 confirm + 文件在动 + **无声明** ⇒ 必须仍红（新分支不许吞掉它）
+  const corpse = diagnoseRings({ selftest: selftest({ active: 0, finding: 0 }), lastConfirmedDays: 27, fileActivityDays: 0 })
+  assert.equal(ring(corpse.rings, 'wire').state, 'red')
+  assert.equal(corpse.broken.filter((b) => b.ring === 'wire').length, 1)
+
+  // ② 对照：同样 27 天 + 文件在动 + **有声明** ∧ 无 active ∧ 无 finding ⇒ yellow，且 broken 里不含 wire
+  const declared = diagnoseRings({ selftest: selftest({ active: 0, finding: 0 }), lastConfirmedDays: 27, fileActivityDays: 0, convergenceActive: true })
+  assert.equal(ring(declared.rings, 'wire').state, 'yellow')
+  assert.match(ring(declared.rings, 'wire').detail, /本季收敛/)
+  assert.equal(declared.broken.filter((b) => b.ring === 'wire').length, 0)
+
+  // ③ 反例：有 active 猜想 ⇒ **不得**走收敛分支（有东西在跑就不算收敛）
+  const withActive = diagnoseRings({ selftest: selftest({ active: 2, finding: 0 }), lastConfirmedDays: 27, fileActivityDays: 0, convergenceActive: true })
+  assert.equal(ring(withActive.rings, 'wire').state, 'red')
+
+  // ④ 反例：有 finding 积压 ⇒ 同样不得走收敛分支（有活没干完不算收敛）
+  const withBacklog = diagnoseRings({ selftest: selftest({ active: 0, finding: 3 }), lastConfirmedDays: 27, fileActivityDays: 0, convergenceActive: true })
+  assert.equal(ring(withBacklog.rings, 'wire').state, 'red')
+
+  // ⑤ 硬停摆分支同样受声明影响：40 天 + 文件也静 + 有声明 ⇒ yellow；无声明 ⇒ red
+  const hardDeclared = diagnoseRings({ selftest: selftest({ active: 0, finding: 0 }), lastConfirmedDays: 40, fileActivityDays: 20, convergenceActive: true })
+  assert.equal(ring(hardDeclared.rings, 'wire').state, 'yellow')
+  const hardBare = diagnoseRings({ selftest: selftest({ active: 0, finding: 0 }), lastConfirmedDays: 40, fileActivityDays: 20 })
+  assert.equal(ring(hardBare.rings, 'wire').state, 'red')
+
+  // ⑥ 声明不影响正常绿：3 天前刚合上 + 有声明 ⇒ 仍是 green（收敛不覆盖「真布线了」）
+  const fresh = diagnoseRings({ selftest: selftest({ active: 0, finding: 0 }), lastConfirmedDays: 3, fileActivityDays: 0, convergenceActive: true })
+  assert.equal(ring(fresh.rings, 'wire').state, 'green')
+})
+
 // ★ 恢复样本：闭环重新合上 ⇒ 必须回绿。恒红与恒绿都不是判据。
 test('★ 恢复：自指闭环 3 天前合上（文件 0 天前在动）⇒ 绿', () => {
   assert.equal(ring(diagnoseRings({ selftest: selftest(), lastConfirmedDays: 3, fileActivityDays: 0 }).rings, 'wire').state, 'green')
@@ -300,6 +335,30 @@ test('buildSuggestions：finding 积压 → 裁决建议（优先级仅次于不
   assert.deepEqual(out, ['【裁决】有 3 条 finding 待裁决：selftest_review（confirm 布线 / refute 淘汰 / refine 细化）'])
 })
 
+// ★ 收敛声明影响建议文案（2026-10-31 · t-8df40786）：声明后不再催推进——
+//   催一次是提醒，催四十次是噪音；但反例护栏（有 active / 有 finding）不成立时仍要催。
+test('★ buildSuggestions：已声明收敛 ⇒ 不催推进；无声明或有 active 时仍催', () => {
+  const base = { evolve: { ok: true, idleDays: 1 }, checkpoints: { ok: true, latestAgeDays: 0 }, lastConfirmedDays: 40 }
+  const wireOf = (out) => out.find((s) => s.startsWith('【布线】'))
+
+  // ① 已声明 + 无 active + 无 finding ⇒ 「已声明本季收敛」，且不含「二选一」
+  const converged = buildSuggestions({ ...base, selftest: selftest({ active: 0, finding: 0 }), convergenceActive: true })
+  assert.match(wireOf(converged), /已声明本季收敛/)
+  assert.doesNotMatch(wireOf(converged), /二选一/)
+
+  // ② 对照：无声明 ⇒ 仍走「二选一」文案
+  const bare = buildSuggestions({ ...base, selftest: selftest({ active: 0, finding: 0 }) })
+  assert.match(wireOf(bare), /二选一/)
+
+  // ③ 反例：有 active 猜想 ⇒ 声明不成立，仍催推进
+  const withActive = buildSuggestions({ ...base, selftest: selftest({ active: 2, finding: 0 }), convergenceActive: true })
+  assert.match(wireOf(withActive), /二选一/)
+
+  // ④ 反例：有 finding 积压 ⇒ 同样不成立
+  const withBacklog = buildSuggestions({ ...base, selftest: selftest({ active: 0, finding: 2 }), convergenceActive: true })
+  assert.match(wireOf(withBacklog), /二选一/)
+})
+
 test('buildSuggestions·评测边界：>14 红建议 / 14 走黄建议 / 7 不提示 / 8 走黄建议', () => {
   const run = (idleDays) => buildSuggestions({ selftest: selftest(), evolve: { ok: true, idleDays }, checkpoints: { ok: true, latestAgeDays: 0 }, lastConfirmedDays: 1 })
   // ★ 2026-10-15：主人重申「别跑进化轮了，收益不高，基准太旧」⇒ 建议文案必须**把「最小探测」与「完整轮」分开**
@@ -329,7 +388,7 @@ test('buildSuggestions·猜想/采证三分：库空→补猜想；空窗→劝�
 test('buildSuggestions·布线/存档边界：闭环 >7 天才提示布线；>3 天才提示存档；背离时加警告', () => {
   const run = (lastConfirmedDays, cpAge, fileActivityDays) => buildSuggestions({ selftest: selftest(), evolve: { ok: true, idleDays: 1 }, checkpoints: { ok: true, latestAgeDays: cpAge, latest: '20260901-010101-aaaaaa' }, lastConfirmedDays, fileActivityDays })
   assert.deepEqual(run(8, 4), [
-    '【布线】自指闭环 8 天未合上（阈值 7 天）：查 rewrite_status 停滞读数（在采证 0 条 ⇒ 采证链断）后推进，或**明确记录本季收敛**（无意识停摆 ≠ 有意识收敛）',
+    '【布线】自指闭环 8 天未合上（阈值 7 天）。二选一：**(a) 推进闭环**（开猜想 → 补证据 → rewrite_verdict confirm）⇒ 转绿；**(b) 显式声明本季收敛**（写 `.dsh/evolution-core/evolution-convergence.json`，格式见 README）⇒ 本环转 yellow「已声明收敛」且不再列断点。⚠ 声明是**显式动作**，机制不会自动假设收敛',
     '【存档】4 天未存档（最近 20260901-010101-aaaaaa）：checkpoint_create 存档点（保活+试错回滚）',
   ])
   assert.deepEqual(run(7, 3), ['五环健康：考虑下一轮进化——技能炼化（skill_signals/skill_extract 找候选）、新猜想（selftest_add）、或评测轮（evolve）'])
