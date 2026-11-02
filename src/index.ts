@@ -513,7 +513,10 @@ export function apply(ctx: Context, config: Config): void {
       },
     },
     async execute(args: { note?: string }) {
-      if (!config.enabled) return { ok: false, error: 'evolution-core disabled', cycleId: undefined, at: undefined, status: undefined, recommendedActions: undefined, hasBlocker: false, logged: false, progress: undefined, progressLine: undefined, advanceRequired: false }
+      // ⚠ **不要**把其余字段显式补成 undefined：dsh-tools 要求返回值整体是合法 JSON，
+      // `{ cycleId: undefined }` 会让整个 value 被判 "must be a lossless JSON object"，
+      // 而报错指向对象本身、看不出是哪个字段。这些字段都非 required，省略键才是对的。
+      if (!config.enabled) return { ok: false, error: 'evolution-core disabled' }
       const now = new Date().toISOString()
       const agg = await aggregate(config)
       const hasBlocker = hasRedRing(agg.rings)
