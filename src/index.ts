@@ -36,8 +36,9 @@ import {
   summarizeSelftest, summarizeEmotion, summarizeReflection, summarizeLifeCore,
   summarizeEvolve, summarizeMemory, summarizeCheckpoints,
   diagnoseRings, buildSuggestions, computeHistoryStats, buildSummary, daysBetween,
+  computeProgress, renderProgressLine, NEEDS_EVIDENCE, ADVANCE_TYPES,
 } from './core.ts'
-import type { OrganSnapshot } from './core.ts'
+import type { OrganSnapshot, ProgressSnapshot } from './core.ts'
 import { TYPE_LABEL, renderOrganLine, ringMark, clampDays, hasRedRing } from './format.ts'
 import { readHistory, appendHistory } from './history-store.ts'
 
@@ -58,7 +59,26 @@ export interface EvolutionCoreService {
     broken: Array<{ ring: string; state: string; signal: string; suggestion: string }>
     suggestions: string[]
     organLines: string[]
+    /**
+     * 推进读数（2026-11-02）：回答「我上次真的改变了什么」。
+     *
+     * 为什么必须随快照一起送出：感知圈原来的判据只有**两态**——
+     * 「有红断点 ⇒ 优先推进」/「五环健康 ⇒ 可续存」。红环是**异常检测**，
+     * 而不推进是**正常态的惰性**，正常态永远不报警 ⇒ 今天 16 圈全部合法「续存」。
+     * 本字段提供第三态所需的读数。**只送读数，不代替任何人的决策**。
+     */
+    progress: ProgressSnapshot
+    /** 推进读数的一行人话（与工具面同口径，避免两处各写一套） */
+    progressLine: string
   } | null>
+  /**
+   * 只算推进读数（轻量：读 history.jsonl + 纯函数，不做全量器官聚合）。
+   *
+   * 存在理由：注入端（life-core `agent/pre-step`）每轮都要一行「距上次推进多久」，
+   * 而全量 `snapshot()` 要读七个器官的文件。让消费方拿全量再自己筛，等于把成本
+   * 转嫁给热路径。返回 null = disabled 或读失败（消费方容错跳过）。
+   */
+  progress(): Promise<ProgressSnapshot | null>
   name: string
 }
 
@@ -79,6 +99,15 @@ export interface Config {
   wireSignalDirs?: string[]
   /** 布线环 green 阈值（天）：**真源**（自指闭环最后合上）≤ 此值 = green（默认 7） */
   wireFreshDays: number
+  /**
+   * 「多久没推进 = 该动了」的阈值（小时，默认 12）。
+   *
+   * 判据为什么是小时而不是「几圈」：圈频可调（当前 180 分钟，忙时调大），
+   * 把阈值写死成圈数会在改呼吸频率时静默失真。小时是外生坐标，不随我的安排变。
+   * 12h 的依据：当前一圈 3h ⇒ 连续 4 圈没推进才报；比「每圈必推进」现实，
+   * 又不至于让一整天滑过去没人提。
+   */
+  advanceIdleHours: number
 }
 export const Config = z.object({
   enabled: z.boolean().default(true),
@@ -86,6 +115,7 @@ export const Config = z.object({
   evolveLedgerPath: z.string().required(false),
   wireSignalDirs: z.array(z.string()).required(false),
   wireFreshDays: z.number().default(7),
+  advanceIdleHours: z.number().default(12),
 })
 
 // ---------- 路径解析 ----------
@@ -218,6 +248,47 @@ function readFileActivity(config: Config): number | null {
   return newest
 }
 
+/** 「有意识收敛」声明文件名（放在 dataDir 下）。 */
+const CONVERGENCE_FILE = 'evolution-convergence.json'
+
+/**
+ * 声明形状（**我手写，机制只读**）。
+ *
+ * ```json
+ * { "declaredAt": 1792397000000, "until": 1794989000000, "reason": "主人暂停评测轮，本季不推进自指闭环" }
+ * ```
+ */
+interface ConvergenceDeclaration {
+  declaredAt: number
+  until: number
+  reason: string
+}
+
+/**
+ * 读「有意识收敛」声明并判有效期（2026-10-31 · t-8df40786）。
+ *
+ * **为什么需要这个**：布线环真源只认「普通 confirmed」，于是要么为点亮环开一条不该开的假设
+ * （Goodhart），要么长期红灯 ⇒ 告警疲劳。同型先例 = 2026-09-21 猜想环的「空窗」多态化
+ * （`active=0 且库中有终态` ⇒ yellow，而不是一律红）。
+ *
+ * **纪律**：声明必须是**我显式写下的文件**——机制不自动假设收敛。文件缺失、JSON 坏、
+ * `until` 非数字、已过期，一律返回 `false`（**fail-closed：宁可红，不可假装收敛**）。
+ *
+ * ⚠ 本函数只答「声明有效吗」；「无 active 猜想 / 无 finding 积压」这两条**反例护栏**在
+ * `core.diagnoseRings` 里判——两处都过，才走收敛分支。
+ */
+function readConvergence(config: Config, now = new Date()): boolean {
+  const path = join(resolveCoreDataDir(config), CONVERGENCE_FILE)
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<ConvergenceDeclaration>
+    if (typeof parsed.until !== 'number' || !Number.isFinite(parsed.until)) return false
+    return now.getTime() <= parsed.until
+  } catch {
+    // 文件不存在 / 解析失败 / 读取失败：一律视为「未声明」。
+    return false
+  }
+}
+
 // ---------- 聚合核心（status/cycle 共用） ----------
 
 async function aggregate(config: Config): Promise<{
@@ -242,8 +313,9 @@ async function aggregate(config: Config): Promise<{
   const lastConfirmedDays = daysBetween(latestConfirmedAt, new Date())
   const fileActivityDays = readFileActivity(config)
   const wireFreshDays = config.wireFreshDays
-  const { rings, broken } = diagnoseRings({ selftest, lastConfirmedDays, fileActivityDays, wireFreshDays })
-  const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastConfirmedDays, fileActivityDays, wireFreshDays })
+  const convergenceActive = readConvergence(config)
+  const { rings, broken } = diagnoseRings({ selftest, lastConfirmedDays, fileActivityDays, wireFreshDays, convergenceActive })
+  const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastConfirmedDays, fileActivityDays, wireFreshDays, convergenceActive })
   return { organs, rings, broken, suggestions }
 }
 
@@ -258,10 +330,20 @@ export function apply(ctx: Context, config: Config): void {
     // 目录创建失败不致命（写入时再试）
   }
 
-  // 进化足迹回流主记忆库（2026-09-06）：cycle/log 写入 history.jsonl 的同时回流记忆（memoryApi 可选，不可用静默）。
-  // 2026-09-26 修（任务 t-5b08143e）：**cycle 不再回流**——它频次最高（一天 25~30 圈）、增量价值最低，
-  // 且 kind=episodic 走 L2/L3「同标题自动合并」⇒「## 进化足迹：感知圈」条目只增不减
-  // （实测 20,796 字符、每天 +1~2K，一个月后 ~50K）。history.jsonl 不受影响，evolution_history 仍完整。
+  // 进化足迹回流主记忆库（2026-09-06 建，2026-11-03 改 · 任务 t-a40cfb9e）。
+  //
+  // ⚠ 旧实现有三个叠在一起的缺陷（2026-11-03 实测）：
+  //   ① `kind: 'episodic'` —— 走 L2/L3「同标题自动合并」⇒ **只增不减**
+  //   ② `key: 'evolve-history-' + ev.id` —— `key` 精确覆盖**只对 L1 fact 生效**，
+  //      对 episodic 无效；而且 id 每次都不同 ⇒ 即便有效也只会每次新建
+  //   ③ 无任何上限 ⇒ 实测长到 11 万字符（8 条）。2026-11-02 归档后**3 小时又长回
+  //      2,000 字符**（两条活跃条目 updatedAt 17:12 / 17:16），证明这不是陈旧问题而是**持续复现**。
+  //
+  // 新实现：`kind: 'fact'` + **按类型固定的 key** ⇒ 同 key 覆盖 ⇒ 每类永远只留**最新一条**。
+  // 判据：流水本来就不该在记忆里（AGENTS.md §3.5 载体分流：教训与结论→记忆库，日志→文件）。
+  // 完整历史在 `history.jsonl`（append-only），`evolution_history` 读它、已能回答
+  // 「最近 N 天做了什么」——所以记忆里留完整流水是**纯冗余**，代价是任何一次 recall 命中
+  // 就把几万字符塞进上下文。
   const REFLUX_TYPES = new Set(['verdict', 'forge', 'evolve', 'wire', 'reflect', 'checkpoint', 'note'])
   const refluxEvent = (ev: { type: string; detail: string; id: string | null }): void => {
     try {
@@ -269,8 +351,11 @@ export function apply(ctx: Context, config: Config): void {
       const api = (ctx as unknown as { memoryApi?: { remember(input: { text: string; kind?: string; tags?: string[]; key?: string }): Promise<unknown> } }).memoryApi
       if (api === undefined) return
       const typeLabel: Record<string, string> = { cycle: '感知圈', verdict: '裁决', forge: '炼化', evolve: '评测轮', wire: '布线', reflect: '反思', checkpoint: '存档', note: '备注' }
-      const text = '## 进化足迹：' + (typeLabel[ev.type] ?? ev.type) + '\n\n' + (ev.detail || '（无说明）')
-      void api.remember({ text, kind: 'episodic', tags: ['进化履历', ev.type], key: 'evolve-history-' + ev.id }).catch(() => { /* 回流失败静默 */ })
+      const label = typeLabel[ev.type] ?? ev.type
+      // 「（最近一次）」写进标题：让读的人一眼知道这条**不是完整履历**，
+      // 完整履历在 history.jsonl / evolution_history。不写等于让未来的自己以为流水只有一条。
+      const text = '## 进化足迹：' + label + '（最近一次）\n\n' + (ev.detail || '（无说明）')
+      void api.remember({ text, kind: 'fact', key: 'evolve-last-' + ev.type, tags: ['进化履历', ev.type] }).catch(() => { /* 回流失败静默 */ })
     } catch { /* 回流失败不阻塞 */ }
   }
 
@@ -282,6 +367,8 @@ export function apply(ctx: Context, config: Config): void {
       const organ = agg.organs[k]
       return organ === undefined ? `${k}: ⚠不可读` : renderOrganLine(k, organ)
     })
+    // 推进读数：唯一真源是 history.jsonl（不看文件 mtime、不看别的器官）
+    const progress = computeProgress(readHistory(dataDir), new Date(), config.advanceIdleHours)
     return {
       at: now,
       hasBlocker: hasRedRing(agg.rings),
@@ -289,6 +376,8 @@ export function apply(ctx: Context, config: Config): void {
       broken: JSON.parse(JSON.stringify(agg.broken)),
       suggestions: agg.suggestions,
       organLines,
+      progress,
+      progressLine: renderProgressLine(progress),
     }
   }
 
@@ -301,6 +390,15 @@ export function apply(ctx: Context, config: Config): void {
         return await aggregateSnapshot()
       } catch (error) {
         logger.warn('snapshot 聚合失败: ' + String(error))
+        return null
+      }
+    },
+    progress: async () => {
+      if (!config.enabled) return null
+      try {
+        return computeProgress(readHistory(dataDir), new Date(), config.advanceIdleHours)
+      } catch (error) {
+        logger.warn('progress 计算失败: ' + String(error))
         return null
       }
     },
@@ -323,6 +421,8 @@ export function apply(ctx: Context, config: Config): void {
           brokenRings: { type: 'json' },
           suggestions: { type: 'json' },
           evolveIdleDays: { type: 'number' },
+          progress: { type: 'json' },
+          progressLine: { type: 'string' },
         },
       },
       render: (_a: unknown, v: any) => {
@@ -332,9 +432,11 @@ export function apply(ctx: Context, config: Config): void {
         const ringLine = rings.map((r: any) => `${ringMark(r.state)}${r.label}${r.state === 'red' ? '!' : ''}`).join(' ')
         const broken = v.brokenRings ?? []
         const sugg = v.suggestions ?? []
+        const pl = v.progressLine === undefined ? '' : String(v.progressLine)
         const text = `【进化状态总览 · ${String(v.at ?? '').slice(0, 16)}】\n` +
           `器官:\n${lines.join('\n')}\n` +
           `五环: ${ringLine}\n` +
+          (pl === '' ? '' : `推进: ${pl}\n`) +
           (broken.length > 0 ? `断点(${broken.length}): ` + broken.map((b: any) => `${b.ring}(${b.state})`).join(',') + '\n' : '') +
           `建议(${sugg.length}):\n` + sugg.map((s: string, i: number) => `  ${i + 1}. ${s}`).join('\n')
         return [{ type: 'text', text }]
@@ -345,6 +447,7 @@ export function apply(ctx: Context, config: Config): void {
       const now = new Date().toISOString()
       const agg = await aggregate(config)
       const evolveIdle = agg.organs.evolve?.ok === true ? (agg.organs.evolve.idleDays as number | null | undefined) ?? null : null
+      const progress = computeProgress(readHistory(dataDir), new Date(), config.advanceIdleHours)
       return {
         ok: true,
         at: now,
@@ -353,6 +456,8 @@ export function apply(ctx: Context, config: Config): void {
         brokenRings: JSON.parse(JSON.stringify(agg.broken)),
         suggestions: agg.suggestions,
         evolveIdleDays: evolveIdle ?? undefined,
+        progress: JSON.parse(JSON.stringify(progress)),
+        progressLine: renderProgressLine(progress),
       }
     },
   }))
@@ -376,6 +481,9 @@ export function apply(ctx: Context, config: Config): void {
           recommendedActions: { type: 'json' },
           hasBlocker: { type: 'boolean' },
           logged: { type: 'boolean' },
+          progress: { type: 'json' },
+          progressLine: { type: 'string' },
+          advanceRequired: { type: 'boolean' },
         },
       },
       render: (_a: unknown, v: any) => {
@@ -383,9 +491,19 @@ export function apply(ctx: Context, config: Config): void {
         const rings = st.fiveRings ?? []
         const ringLine = rings.map((r: any) => `${ringMark(r.state)}${r.label}`).join(' ')
         const sugg = v.recommendedActions ?? []
-        const head = v.hasBlocker ? '⚠ 有红环断点——本圈建议优先推进' : '五环健康——本圈可续存或自主推进'
+        const pl = String(v.progressLine ?? '')
+        // 三态（2026-11-02 修）：原来只有两态——「有红断点 ⇒ 优先推进」/「五环健康 ⇒ 可续存」。
+        // 而红环是**异常检测**、不推进是**正常态的惰性** ⇒ 正常态永远落进「可续存」。
+        // 实测代价：2026-11-02 一天 16 圈全部合法续存，履历 20 次动作里推进寥寥。
+        const head = v.hasBlocker === true
+          ? '⚠ 有红环断点——本圈优先推进断点'
+          : (v.advanceRequired === true
+            // 读数已在上面「推进:」那行给过，这里只说结论——重复一遍读数会让每圈多读一行废话
+            ? '⚠ 距上次推进已超阈值 ⇒ 本圈必须产出一条推进（wire / verdict / forge / reflect 之一，带证据指针），「续存」不是本圈的选项'
+            : '刚推进过——本圈可续存或自主推进')
         const text = `【本圈进化推进清单 · ${String(v.at ?? '').slice(0, 16)}】\n` +
           `五环: ${ringLine}\n` +
+          `推进: ${pl}\n` +
           `${head}\n` +
           sugg.map((s: string, i: number) => `  ${i + 1}. ${s}`).join('\n') +
           (v.logged ? `\n(已记 cycle 足迹 ${String(v.cycleId ?? '')})` : '')
@@ -393,10 +511,13 @@ export function apply(ctx: Context, config: Config): void {
       },
     },
     async execute(args: { note?: string }) {
-      if (!config.enabled) return { ok: false, error: 'evolution-core disabled', cycleId: undefined, at: undefined, status: undefined, recommendedActions: undefined, hasBlocker: false, logged: false }
+      if (!config.enabled) return { ok: false, error: 'evolution-core disabled', cycleId: undefined, at: undefined, status: undefined, recommendedActions: undefined, hasBlocker: false, logged: false, progress: undefined, progressLine: undefined, advanceRequired: false }
       const now = new Date().toISOString()
       const agg = await aggregate(config)
       const hasBlocker = hasRedRing(agg.rings)
+      // 推进读数在**写入本次 cycle 之前**算：cycle 不属推进类型，先后不影响数值，
+      // 但口径顺序写死「先读后记」，避免将来有人给 cycle 算进推进时读到自己这一条。
+      const progress = computeProgress(readHistory(dataDir), new Date(), config.advanceIdleHours)
       const loggedEv = appendHistory(dataDir, { type: 'cycle', detail: args.note ?? '' })
       if (loggedEv !== null) refluxEvent({ type: 'cycle', detail: args.note ?? '', id: loggedEv.id })
       const evolveIdle = agg.organs.evolve?.ok === true ? (agg.organs.evolve.idleDays as number | null | undefined) ?? null : null
@@ -415,6 +536,9 @@ export function apply(ctx: Context, config: Config): void {
         recommendedActions: agg.suggestions,
         hasBlocker,
         logged: loggedEv !== null,
+        progress: JSON.parse(JSON.stringify(progress)),
+        progressLine: renderProgressLine(progress),
+        advanceRequired: progress.stale,
       }
     },
   }))
@@ -422,11 +546,15 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- evolution_log（§5.3） ----------
   ctx.tools.register(defineTool({
     name: 'evolution_log',
-    description: '进化核心·留痕：把一次进化动作（verdict 裁决 / forge 炼化 / evolve 评测轮 / wire 布线 / reflect 每日反思 / checkpoint 存档 / cycle 感知圈 / note 备注）记入进化履历（history.jsonl）。供 evolution_history 展示成长足迹（积极性正反馈）。',
+    description: '进化核心·留痕：把一次进化动作（verdict 裁决 / forge 炼化 / evolve 评测轮 / wire 布线 / reflect 每日反思 / checkpoint 存档 / cycle 感知圈 / note 备注）记入进化履历（history.jsonl）。'
+      + '⚠ 只有 verdict / forge / wire / evolve / reflect 算**推进**（改了东西）；cycle（我来过）、note（备注）、checkpoint（保存现场）不算。'
+      + 'verdict / forge / wire **必须带 evidence 证据指针**（path:line / 记忆 id / 技能名 / 提交号），否则这条记为「未入账」并计入连续无证据数——采纳 ≠ 有效。',
     parameters: {
       type: { type: 'string', required: true, enum: ['cycle', 'verdict', 'forge', 'evolve', 'wire', 'reflect', 'checkpoint', 'note'], description: '动作类型' },
       detail: { type: 'string', description: '一句话说明' },
       ref: { type: 'string', description: '关联 id（如假设 id/技能名）' },
+      evidence: { type: 'string', description: '证据指针：这次推进凭什么说它改变了东西（path:line / 记忆 id / 技能名 / 提交号 / 工具名）。verdict / forge / wire 必填才算入账。' },
+      delta: { type: 'string', description: '改前/改后读数差（可选，如「dst 27→11 页」「命中率 0.42→0.61」）。与 evidence 分工：evidence 指去哪看，delta 指变了多少。' },
     },
     output: {
       schema: {
@@ -438,16 +566,40 @@ export function apply(ctx: Context, config: Config): void {
           id: { type: 'string' },
           ts: { type: 'string' },
           error: { type: 'string' },
+          evidence: { type: 'string' },
+          needsEvidence: { type: 'boolean' },
+          isAdvance: { type: 'boolean' },
         },
       },
-      render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? `已记录进化动作（${TYPE_LABEL[v.type] ?? v.type}）[${v.id}]` : `记录失败：${String(v.error ?? '')}` }],
+      render: (_a: unknown, v: any) => {
+        if (v.ok !== true) return [{ type: 'text', text: `记录失败：${String(v.error ?? '')}` }]
+        const label = TYPE_LABEL[v.type] ?? v.type
+        let text = `已记录进化动作（${label}）[${v.id}]`
+        if (v.isAdvance !== true) {
+          text += '\n（此行不计入「推进」——cycle/note/checkpoint 是「我来过 / 备注 / 保存」，不是「我改变了什么」）'
+        } else if (v.needsEvidence === true && !v.evidence) {
+          text += `\n⚠ 未带证据指针 ⇒ 本条记为「未入账」（采纳 ≠ 有效）。补一次：evolution_log(type="${String(v.type)}", evidence="path:line 或记忆 id", delta="改前→改后")`
+        }
+        return [{ type: 'text', text }]
+      },
     },
-    async execute(args: { type: string; detail?: string; ref?: string }) {
+    async execute(args: { type: string; detail?: string; ref?: string; evidence?: string; delta?: string }) {
       if (!config.enabled) return { ok: false, error: 'evolution-core disabled' }
-      const ev = appendHistory(dataDir, { type: args.type, detail: args.detail ?? '', ref: args.ref ?? null })
+      const ev = appendHistory(dataDir, { type: args.type, detail: args.detail ?? '', ref: args.ref ?? null, evidence: args.evidence, delta: args.delta })
       if (ev === null) return { ok: false, error: 'history.jsonl 写入失败' }
-      refluxEvent({ type: args.type, detail: args.detail ?? '', id: ev.id })
-      return { ok: true, type: args.type, id: ev.id, ts: ev.ts }
+      refluxEvent({ type: args.type, detail: (args.detail ?? '') + (args.evidence ? ' · 证据 ' + args.evidence : ''), id: ev.id })
+      return {
+        ok: true,
+        type: args.type,
+        id: ev.id,
+        ts: ev.ts,
+        // 空证据不入返回值：schema 声明 evidence 是 string（非 required），给 null / undefined
+        // 都会被「无损 JSON」检查拒绝 —— 实测 `evolution_log(type='note')` 必踩（note/checkpoint
+        // 本就不该带证据）。与 history-store.ts:66 同一写法，别在两处各写一套。
+        ...(ev.evidence === undefined ? {} : { evidence: ev.evidence }),
+        needsEvidence: NEEDS_EVIDENCE.has(args.type),
+        isAdvance: ADVANCE_TYPES.has(args.type),
+      }
     },
   }))
 

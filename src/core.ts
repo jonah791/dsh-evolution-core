@@ -36,6 +36,21 @@ export interface HistoryEvent {
   type: string
   detail?: string
   ref?: string | null
+  /**
+   * 证据指针（2026-11-02 新增）：这次推进**凭什么说它改变了东西**。
+   *
+   * 形状 = `path:line` / 记忆 id / 技能名 / 提交号 / 工具名。空 ⇒ 这次推进**未入账为有证据**。
+   * 存在理由：AGENTS.md §3.4「采纳 ≠ 有效」——20 次动作全绿但一条证据都没有，
+   * 那是「它还留着」，不是「它有效」。本字段让「有没有效」变成可数的事实。
+   */
+  evidence?: string
+  /**
+   * 改前/改后的读数差（可选，自由文本）：如 `dst 27→11 页`、`命中率 0.42→0.61`。
+   *
+   * 与 `evidence` 的分工：evidence 指「去哪看」，delta 指「变了多少」。
+   * 只有 evidence 没有 delta 也是合法的（有些改动只能证明存在，不能证明幅度）。
+   */
+  delta?: string
 }
 
 // ---------- 工具函数 ----------
@@ -239,6 +254,21 @@ export interface RingInput {
    * 只用于**背离检测**，不参与环状态判定——它正是那个会骗人的量。
    */
   fileActivityDays?: number | null
+  /**
+   * **有意识收敛声明**是否有效（2026-10-31 新增，t-8df40786）。
+   *
+   * 病：布线环真源只认「普通 confirmed」，于是要么为点亮环开一条不该开的假设（Goodhart），
+   * 要么长期红灯 ⇒ 告警疲劳。同型先例 = 2026-09-21 猜想环（`active=0 且库中有终态` 判 yellow 空窗）。
+   *
+   * 修法：存在**我显式写下的收敛声明** ∧ 无 active 猜想 ∧ 无 finding 积压 ⇒ yellow「本季收敛（已声明）」，
+   * **不进 broken**。声明由 `index.ts` 从磁盘读并判有效期，本函数只收布尔值以保持纯函数。
+   *
+   * ⚠ 三条边界（判据见 tests）：
+   * - **未声明**的长期红灯仍判红（无意识停摆 ≠ 有意识收敛）
+   * - 有 active 猜想时**不得**走收敛分支（有东西在跑就不算收敛）
+   * - 有 finding 积压时**不得**走收敛分支（有活没干完不算收敛）
+   */
+  convergenceActive?: boolean
   /** 布线环 green 阈值（天，默认 7）。2026-10-18 从 Config 接通（原「半死参数」，语义文档 U3）。 */
   wireFreshDays?: number
 }
@@ -323,6 +353,9 @@ export function diagnoseRings(input: RingInput): { rings: RingState[]; broken: B
   const fileDays = input.fileActivityDays ?? null
   // 背离：文件在动（≤fresh）而闭环停在 staleAfter 之外 ⇒ **代理量正在掩盖真量**
   const drift = wireDays !== null && wireDays > staleAfter && fileDays !== null && fileDays <= fresh
+  // 有意识收敛（2026-10-31 t-8df40786）：声明有效 ∧ 无 active 猜想 ∧ 无 finding 积压。
+  // ⚠ 后两条是**反例护栏**——有东西在跑、或有活没干完，都不算「收敛」，不许被声明吞掉。
+  const converged = input.convergenceActive === true && active === 0 && finding === 0
   if (wireDays === null) {
     rings.push({ name: 'wire', label: '布线', state: 'red', detail: '自指引擎从未裁决布线（无普通 confirmed 假设）' })
     broken.push({ ring: 'wire', state: 'red', signal: '无布线记录（普通 confirmed = 0）', suggestion: '让一条猜想跑出 finding 后走 rewrite_verdict(confirm)——⚠ 使能型声明（enabling）兑现不算布线' })
@@ -330,15 +363,19 @@ export function diagnoseRings(input: RingInput): { rings: RingState[]; broken: B
     rings.push({ name: 'wire', label: '布线', state: 'green', detail: `自指闭环 ${wireDays} 天前合上` })
   } else if (wireDays <= staleAfter) {
     rings.push({ name: 'wire', label: '布线', state: 'yellow', detail: `自指闭环 ${wireDays} 天前合上（偏久）` })
+  } else if (converged) {
+    // 已声明收敛：yellow 而非 red，且**不进 broken**——「无意识停摆」与「有意识收敛」在这里分道。
+    rings.push({ name: 'wire', label: '布线', state: 'yellow',
+      detail: `本季收敛（已声明）：自指闭环 ${wireDays} 天未合上，但无 active 猜想、无 finding 积压` })
   } else if (drift) {
     rings.push({ name: 'wire', label: '布线', state: 'red',
       detail: `自指闭环停 ${wireDays} 天，而技能文件 ${fileDays} 天前还在动——**代理量背离**（文件活动 ≠ 布线推进）` })
     broken.push({ ring: 'wire', state: 'red',
       signal: `代理量背离：fileActivity=${fileDays}d（≤${fresh} 新鲜）而 lastConfirmed=${wireDays}d（>${staleAfter}）`,
-      suggestion: '这正是 Proxy Drift 的形状——文件在动让人以为在布线。查 rewrite_status 停滞读数（在采证 0 条 ⇒ 采证链断）后推进，或**明确记录本季收敛**（无意识停摆 ≠ 有意识收敛）' })
+      suggestion: '这正是 Proxy Drift 的形状——文件在动让人以为在布线。二选一：**(a) 推进闭环**（开猜想 → 补证据 → rewrite_verdict confirm）⇒ 本环转绿；**(b) 显式声明本季收敛**（写 .dsh/evolution-convergence.json，见 README）⇒ 本环转 yellow「已声明收敛」，不再列 broken。⚠ 声明是**显式动作**，机制不会自动假设收敛' })
   } else if (wireDays > hardStale) {
     rings.push({ name: 'wire', label: '布线', state: 'red', detail: `${wireDays} 天无裁决布线（自指闭环停摆）` })
-    broken.push({ ring: 'wire', state: 'red', signal: `lastConfirmed ${wireDays} 天（>${hardStale}）`, suggestion: '查 rewrite_status 停滞读数并推进：开一条新猜想 / 给在采证假设补证据 / 明确记录收敛' })
+    broken.push({ ring: 'wire', state: 'red', signal: `lastConfirmed ${wireDays} 天（>${hardStale}）`, suggestion: '自指闭环硬停摆。查 rewrite_status 后二选一：推进闭环（开猜想 → 补证据 → rewrite_verdict confirm）⇒ 转绿；或显式声明本季收敛（写 .dsh/evolution-convergence.json）⇒ 转 yellow「已声明收敛」' })
   } else {
     rings.push({ name: 'wire', label: '布线', state: 'yellow', detail: `自指闭环 ${wireDays} 天前合上（偏久，文件活动未掩盖：${fileDays ?? '?'} 天前）` })
   }
@@ -357,6 +394,13 @@ export interface SuggestionInput {
   /** 代理量：技能目录最新 mtime 距今天数（只做背离提示） */
   fileActivityDays?: number | null
   wireFreshDays?: number
+  /**
+   * 有意识收敛声明是否有效（见 RingInput.convergenceActive）。
+   *
+   * 影响**文案**而非环状态：声明成立时不再催「推进闭环」——催一次是提醒，催四十次是噪音。
+   * ⚠ 护栏与 `diagnoseRings` 同源：还需 selftest 的 `active === 0 && finding === 0`。
+   */
+  convergenceActive?: boolean
 }
 
 /** 生成行动建议（优先级排序，来自设计 §5.1 规则 1-7） */
@@ -411,9 +455,23 @@ export function buildSuggestions(input: SuggestionInput): string[] {
     out.push('【布线】自指引擎从未裁决布线（普通 confirmed = 0）：让一条猜想跑出 finding 后走 rewrite_verdict(confirm)')
   } else if (wireDays > wireFresh) {
     const drift = wireDays > wireFresh * 2 && fileDays !== null && fileDays <= wireFresh
-    out.push(`【布线】自指闭环 ${wireDays} 天未合上（阈值 ${wireFresh} 天）` +
-      (drift ? `；⚠ 而技能文件 ${fileDays} 天前还在动——**代理量背离**（Proxy Drift：文件活动 ≠ 布线推进）` : '') +
-      '：查 rewrite_status 停滞读数（在采证 0 条 ⇒ 采证链断）后推进，或**明确记录本季收敛**（无意识停摆 ≠ 有意识收敛）')
+    // 2026-10-31（t-8df40786）：已声明收敛时不再催推进——催一次是提醒，催四十次是噪音。
+    // 但必须**同时**无 active 猜想、无 finding 积压（与 diagnoseRings 的护栏同源），否则声明不成立。
+    const convergedHere = input.convergenceActive === true
+      && (st?.ok !== true || (num(st?.active) === 0 && num(st?.finding) === 0))
+    if (convergedHere) {
+      // 2026-11-02 修：原文只写「已声明本季收敛」，**没写收敛的范围** ⇒ 被读成停工令，
+      // 布线环因此 42 天没动（感知圈记录原话：「布线已声明本季收敛」⇒ 不碰进化环）。
+      // 而声明文件自己写清了：收敛的是 **rewrite 自指闭环（评测轮口径）**，
+      // 「改为把经验写进技能与记忆」是**换路，不是停做**。范围必须在读数里说全，
+      // 否则读的人（包括我自己）会按最省事的解释去理解。
+      out.push(`【布线】自指闭环 ${wireDays} 天未合上，但**已声明本季收敛**（.dsh/evolution-core/evolution-convergence.json）——这是有意识的选择，不是停摆。`
+        + `⚠ **收敛范围仅限 rewrite 自指闭环（完整评测轮口径）**：「把经验写进技能与记忆」这条真布线**不在收敛范围内，照常推进并记 evolution_log(type=wire, evidence=…)**。重开条件见声明文件的 reason 字段`)
+    } else {
+      out.push(`【布线】自指闭环 ${wireDays} 天未合上（阈值 ${wireFresh} 天）` +
+        (drift ? `；⚠ 而技能文件 ${fileDays} 天前还在动——**代理量背离**（Proxy Drift：文件活动 ≠ 布线推进）` : '') +
+        '。二选一：**(a) 推进闭环**（开猜想 → 补证据 → rewrite_verdict confirm）⇒ 转绿；**(b) 显式声明本季收敛**（写 `.dsh/evolution-core/evolution-convergence.json`，格式见 README）⇒ 本环转 yellow「已声明收敛」且不再列断点。⚠ 声明是**显式动作**，机制不会自动假设收敛')
+    }
   }
 
   const cpAge = cp?.ok === true ? (cp?.latestAgeDays as number | null | undefined) : null
@@ -500,4 +558,115 @@ export function buildSummary(stats: HistoryStats): string {
   parts.push(`连续 ${stats.streakDays} 天活跃`)
   if (top.length > 0) parts.push(`最多: ${top}`)
   return parts.join(' · ') + '。'
+}
+
+// ---------- 推进读数（2026-11-02：让自进化成为 loop 的一环） ----------
+
+/**
+ * 哪些动作算「推进」。
+ *
+ * 判据：**它有没有改变任何东西**。所以排除三类——
+ *   - `cycle`：我来过这一圈，不是推进（一天 25~30 圈，全算就是灌水；这正是 42 天
+ *     「布线环没合上但履历很热闹」的原因）
+ *   - `note`：备注
+ *   - `checkpoint`：保存现场，不是改进现场
+ * 剩下的五类都声称自己改变了什么：裁决改认知、炼化改技能、布线改规则、
+ * 评测改版本、反思改判断。
+ */
+export const ADVANCE_TYPES: ReadonlySet<string> = new Set(['verdict', 'forge', 'wire', 'evolve', 'reflect'])
+
+/**
+ * 哪些动作**必须带证据指针**才算数。
+ *
+ * `evolve` 不在此列：评测轮的证据是 ledger 里的分数差，不由本字段承载。
+ * `reflect` 不在此列：反思的证据是它引用的记忆/事件，通常已写在 detail 里。
+ */
+export const NEEDS_EVIDENCE: ReadonlySet<string> = new Set(['verdict', 'forge', 'wire'])
+
+export interface ProgressSnapshot {
+  /** 最近一次「推进」的时刻（ISO）；null = 从未推进过 */
+  lastAdvanceAt: string | null
+  /** 距上次推进的小时数；null = 从未推进过 */
+  hoursSinceAdvance: number | null
+  /** 最近 7 天的推进次数 */
+  advanceCount7d: number
+  /** 累计推进次数 */
+  advanceTotal: number
+  /** 累计带证据的推进次数 */
+  creditedTotal: number
+  /**
+   * 最近**连续**多少条「需要证据」的推进**没带证据**（从最新往回数，遇到带证据的停）。
+   *
+   * ⚠ 这是**质量**读数，不参与「该不该推进」的判定——那是 `stale` 的事。
+   * 分工：`stale` 回答「要不要动」，本字段回答「动了算不算数」。
+   */
+  creditlessStreak: number
+  /** 距上次推进已超过阈值：本圈需要一次推进 */
+  stale: boolean
+  /** 阈值（小时），回显便于核对口径 */
+  idleHours: number
+}
+
+/**
+ * 从履历算推进读数。
+ *
+ * ⚠ 口径声明（读数三问的第三问）：只看 events 与 now，不看文件 mtime、不看别的器官——
+ * 「推进」的唯一真源是 history.jsonl 里的事实。
+ */
+export function computeProgress(events: HistoryEvent[], now: Date, idleHours: number): ProgressSnapshot {
+  const advances = events
+    .filter((e) => ADVANCE_TYPES.has(e.type))
+    .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime())
+
+  const lastAdvanceAt = advances.length > 0 ? advances[0]!.ts : null
+  const hoursSinceAdvance = lastAdvanceAt === null
+    ? null
+    : Math.max(0, (now.getTime() - new Date(lastAdvanceAt).getTime()) / 3600000)
+
+  const cutoff = now.getTime() - 7 * 86400000
+  const advanceCount7d = advances.filter((e) => new Date(e.ts).getTime() >= cutoff).length
+
+  const evidenceOf = (e: HistoryEvent): string => {
+    const v = (e as HistoryEvent & { evidence?: string }).evidence
+    return typeof v === 'string' ? v.trim() : ''
+  }
+  const creditedTotal = advances.filter((e) => evidenceOf(e) !== '').length
+
+  // 窗口（2026-11-02 实测修正）：不限窗口时这个数会把**全部历史**算进来——
+  // 上线首日实测 `creditlessStreak=286`，其中 280 条是 30 天以前的老记录。
+  // 「连续 286 条无证据」读起来像「最近连做 286 次都没带证据」，那是错的读数
+  // （读数三问第一问：这个数说的是哪个域）。改成 7 天，与 `advanceCount7d` 同窗同口径。
+  const creditCutoff = now.getTime() - 7 * 86400000
+  let creditlessStreak = 0
+  for (const e of advances) {
+    if (new Date(e.ts).getTime() < creditCutoff) break
+    if (!NEEDS_EVIDENCE.has(e.type)) continue
+    if (evidenceOf(e) !== '') break
+    creditlessStreak += 1
+  }
+
+  // 从未推进过也算 stale（否则新装插件永远等下去，与「缺省不是健康」同一条纪律）
+  const stale = hoursSinceAdvance === null ? true : hoursSinceAdvance >= idleHours
+
+  return {
+    lastAdvanceAt,
+    hoursSinceAdvance: hoursSinceAdvance === null ? null : Math.round(hoursSinceAdvance * 10) / 10,
+    advanceCount7d,
+    advanceTotal: advances.length,
+    creditedTotal,
+    creditlessStreak,
+    stale,
+    idleHours,
+  }
+}
+
+/** 推进读数的单行人话（感知圈与每轮注入共用，口径单一） */
+export function renderProgressLine(p: ProgressSnapshot): string {
+  if (p.advanceTotal === 0) {
+    return '从未推进（本圈必须产出一次：finding / wire / verdict 之一，且带证据指针）'
+  }
+  const h = p.hoursSinceAdvance === null ? '?' : String(p.hoursSinceAdvance)
+  const tail = p.stale ? `≥${p.idleHours}h ⇒ 本圈必须推进` : '正常'
+  const credit = p.creditlessStreak > 0 ? ` ｜ 连续 ${p.creditlessStreak} 条无证据` : ''
+  return `${h}h 前推进（7 天 ${p.advanceCount7d} 次 · 累计 ${p.advanceTotal}）${credit} ｜ ${tail}`
 }

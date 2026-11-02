@@ -48,20 +48,26 @@ export function nextHistoryId(nowMs: number): string {
  */
 export function appendHistory(
   dataDir: string,
-  ev: { type: string; detail?: string; ref?: string | null },
+  ev: { type: string; detail?: string; ref?: string | null; evidence?: string; delta?: string },
   now: Date = new Date(),
-): { id: string; ts: string } | null {
+): { id: string; ts: string; evidence?: string } | null {
   try {
     mkdirSync(dataDir, { recursive: true })
+    const evidence = typeof ev.evidence === 'string' && ev.evidence.trim() !== '' ? ev.evidence.trim() : undefined
+    const delta = typeof ev.delta === 'string' && ev.delta.trim() !== '' ? ev.delta.trim() : undefined
     const full: HistoryEvent = {
       id: nextHistoryId(now.getTime()),
       ts: now.toISOString(),
       type: ev.type,
       detail: ev.detail ?? '',
       ref: ev.ref ?? null,
+      // 空串不入盘：让「没有证据」在文件里表现为**字段不存在**，而不是「等于空」——
+      // 两者在 JSON 里都是 undefined，但写入时保留空串会让下游误以为「填过了」。
+      ...(evidence === undefined ? {} : { evidence }),
+      ...(delta === undefined ? {} : { delta }),
     }
     appendFileSync(historyPath(dataDir), JSON.stringify(full) + '\n', 'utf-8')
-    return { id: full.id, ts: full.ts }
+    return { id: full.id, ts: full.ts, evidence }
   } catch {
     return null
   }
