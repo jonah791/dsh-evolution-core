@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-evolution-core"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-61%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-94%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：把七个进化器官的实时状态聚合成一张「五环完整性」体检报告——**猜想 → 采证 → finding → 裁决 → 布线**，哪一环断了、本圈该先做什么，一条 `evolution_cycle` 说完。
@@ -116,11 +116,15 @@ tail -3 "$DSH_HOME/evolution-core/history.jsonl"
 npm run build && npm test        # build = tsc；test = node --test "tests/*.test.mjs"
 ```
 
-**61 例离线测试全绿**（2026-09-14 实测 `# pass 61 / # fail 0`），跑 `lib/` 产物（与运行时同源）：
+**94 例离线测试全绿**（2026-11-03 复跑 `# pass 94 / # fail 0`），跑 `lib/` 产物（与运行时同源）：
+
+> 历史读数：2026-09-14 实测 `# pass 61 / # fail 0`。**那次的日期与输出保留原样**——把日期和数字一起改掉，就是把「当时量到 61」变成一句从未发生过的观测。
 
 - `tests/core.test.mjs` — 五环诊断纯函数：各环 green/yellow/red 阈值与断点生成、器官不可读降黄（**不产生断点**）、建议排序优先级、`snapshot()` 聚合形状
 - `tests/format.test.mjs` — 履历格式化：`history.jsonl` 序列化稳定性、坏行/半行跳过、`days` 收敛到 `[1, 3650]`
 - `tests/history-store.test.mjs` — 履历 IO 薄壳：路径解析、追加写、`id` 唯一性、写失败返回 `null`（**不抛**）
+- `tests/progress.test.mjs` — 推进判据：`ADVANCE_TYPES` 只有改东西的五类算推进（`cycle`/`note`/`checkpoint` 不算），`NEEDS_EVIDENCE` 要求 `wire`/`verdict`/`forge` 带证据，以及「只有 `cycle` 的一天 `advanceTotal` 必须为 0」
+- `tests/salvage.test.mjs` — 裁决的可复用组件：`verdict` 缺 `salvage` 被拒（尸体测试）、显式 `["none"]` 放行（**「想过、没有」≠「忘了写」**）、归一化容错、非 `verdict` 类型不受此门约束、缺字段的旧行按缺失读回
 
 **不需要网络、不需要任何其他器官插件在线**——聚合层对「文件缺失 / 格式损坏」全部走失败路径。真实器官的联动（life-core 取 `snapshot()` 决定唤醒文案）属线上验收范围。
 
