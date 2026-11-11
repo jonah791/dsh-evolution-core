@@ -335,6 +335,75 @@ test('buildSuggestions：finding 积压 → 裁决建议（优先级仅次于不
   assert.deepEqual(out, ['【裁决】有 3 条 finding 待裁决：selftest_review（confirm 布线 / refute 淘汰 / refine 细化）'])
 })
 
+// ★ 推送积压告警（2026-11-08 · lh-6446b715）：挂点 = 感知圈每次必走的 aggregate。
+//   判据不是「代码里有这一段」，是「有积压会报 / 读不到不伪造平安」。
+const gbBase = { selftest: selftest(), evolve: { ok: true, idleDays: 1 }, checkpoints: { ok: true, latestAgeDays: 0 }, lastConfirmedDays: 1 }
+
+test('★ buildSuggestions：git 积压 → 出【推送】建议，含仓名/总数/扫描范围，深的排前面', () => {
+  const out = buildSuggestions({
+    ...gbBase,
+    gitBacklog: { scanned: 79, total: 143, repos: [{ repo: 'b/y', ahead: 43 }, { repo: 'a/x', ahead: 100 }] },
+  })
+  const push = out.find((s) => s.startsWith('【推送】'))
+  assert.ok(push, '有积压必须出建议')
+  assert.match(push, /2 个仓共 143 个提交/)
+  assert.match(push, /扫描 79 仓/)
+  assert.match(push, /a\/x\(100\) \/ b\/y\(43\)/) // 按 ahead 降序
+})
+
+test('★ 三态：gitBacklog 缺省或 null（读不到）⇒ 不出建议，且不印「无积压」的平安', () => {
+  for (const v of [undefined, null]) {
+    const out = buildSuggestions({ ...gbBase, gitBacklog: v })
+    assert.equal(out.filter((s) => s.startsWith('【推送】')).length, 0, `gitBacklog=${v} 不该报`)
+    assert.ok(!out.some((s) => /0 个提交|无积压|推送正常/.test(s)), '读不到 ≠ 没积压，不许伪造平安')
+  }
+})
+
+test('★ total=0（读了且干净）⇒ 不报——core 层与「读不到」同为不出建议，区分在采集层', () => {
+  const out = buildSuggestions({ ...gbBase, gitBacklog: { scanned: 79, total: 0, repos: [] } })
+  assert.equal(out.filter((s) => s.startsWith('【推送】')).length, 0)
+})
+
+// ★ 「不设阈值」的正向锁（2026-11-08 裁决 · 删掉 gitBacklogThreshold 时补）：
+//   1 个提交也必须报。理由：143 的积压就是从 1 攒起来的；一旦允许「够几个才报」，
+//   就等于允许小积压永久挂账——而那正是本条要消灭的形状。
+//   ⇒ 谁将来再加阈值，这条测试必须转红。
+test('★ total=1 也必须报（不设阈值）——143 的积压是从 1 攒起来的', () => {
+  const out = buildSuggestions({
+    ...gbBase,
+    gitBacklog: { scanned: 79, total: 1, repos: [{ repo: 'self-plugins/dsh-agent-memory', ahead: 1 }] },
+  })
+  const push = out.find((s) => s.startsWith('【推送】'))
+  assert.ok(push, '1 个提交未推也必须报——这正是删掉阈值的理由')
+  assert.match(push, /1 个仓共 1 个提交/)
+})
+
+// ★ 采集器自相矛盾时的护栏（2026-11-12 补 · 台账 lh-6446b715）：`total>0` 但 `repos:[]`。
+//   形状非法（说要报总数却点不出是哪些仓）⇒ **不报也不崩**：报出去也是「N 个提交未推送： 」
+//   这种没法行动的半句话；而崩掉会让整轮感知圈的建议清单全灭（更贵）。
+//   ⚠ 这条不是「阈值」的复活：判据仍然只看 total>0，repos 为空只是采集异常时的降级。
+test('★ repos 为空但 total>0（采集器自相矛盾）⇒ 不崩、也不出半句话建议', () => {
+  let out
+  assert.doesNotThrow(() => {
+    out = buildSuggestions({ ...gbBase, gitBacklog: { scanned: 79, total: 3, repos: [] } })
+  }, '采集异常不得把整轮建议带崩')
+  assert.equal(out.filter((s) => s.startsWith('【推送】')).length, 0, '点不出仓名的建议没法行动，不出')
+})
+
+// ★ 死参数的机械锁（2026-11-12 · 台账 lh-6446b715）：`gitBacklogThreshold` 曾被声明成
+//   Config 字段（默认 5）却**从未被读取**——死参数比没有参数更坏（它让人以为有控制）。
+//   裁决是删字段而不是补阈值（「有任何积压就报」才是对的），所以真源里不许再出现它。
+//   ⇒ 谁将来把它加回 Config，这条测试必须转红。
+test('★ Config 里不得再有 gitBacklogThreshold（死参数的机械锁）', async () => {
+  const { Config } = await import('../lib/index.js')
+  const cfg = Config({})
+  assert.equal('gitBacklogThreshold' in cfg, false, '死参数已裁决删除，不许加回 Config')
+  // 判据仍然只看「有没有积压」——schema 里也不该出现任何「够几个才报」的阈值字段
+  for (const key of Object.keys(cfg)) {
+    assert.doesNotMatch(key, /backlog|threshold/i, `Config 不应有积压阈值类字段：${key}`)
+  }
+})
+
 // ★ 收敛声明影响建议文案（2026-10-31 · t-8df40786）：声明后不再催推进——
 //   催一次是提醒，催四十次是噪音；但反例护栏（有 active / 有 finding）不成立时仍要催。
 test('★ buildSuggestions：已声明收敛 ⇒ 不催推进；无声明或有 active 时仍催', () => {

@@ -424,6 +424,25 @@ export function diagnoseRings(input: RingInput): { rings: RingState[]; broken: B
 
 // ---------- 建议生成（§5.1 优先级） ----------
 
+/**
+ * git 推送积压（2026-11-08 新增 · lh-6446b715）。
+ *
+ * 存在理由：44 仓曾静默积压 143 提交 / 20 天，而检测全靠「想起来」——
+ * 挂点选在这里是因为感知圈每次都调 evolution_cycle ⇒ 这是少数「必然经过 + 周期性」
+ * 且不引入外部节拍器的位置（AGENTS.md §2.4 禁止外部节拍器）。
+ *
+ * 分工：采集在 index.ts（调 scripts/git-ahead-audit.mjs），本文件只接收数字——
+ * 纯函数不碰外部命令，保持可离线证伪。
+ */
+export interface GitBacklog {
+  /** 扫描到的仓数（分母：缺了就没法判断「1 个仓积压」是在多大范围内） */
+  scanned: number
+  /** 全仓未推送提交总数 */
+  total: number
+  /** 有积压的仓（repo 为仓根相对路径，ahead 为未推送提交数） */
+  repos: Array<{ repo: string; ahead: number }>
+}
+
 export interface SuggestionInput {
   selftest?: OrganSnapshot
   evolve?: OrganSnapshot
@@ -440,6 +459,13 @@ export interface SuggestionInput {
    * ⚠ 护栏与 `diagnoseRings` 同源：还需 selftest 的 `active === 0 && finding === 0`。
    */
   convergenceActive?: boolean
+  /**
+   * git 推送积压（可选）。
+   *
+   * 三态语义（与 rulesInBlock 同纪律）：null 或缺省 = **未采集 / 采集失败**，
+   * 此时**不产生建议也不报平安**——「读不到」不是「没积压」，印成 0 就是把未知伪装成健康。
+   */
+  gitBacklog?: GitBacklog | null
 }
 
 /** 生成行动建议（优先级排序，来自设计 §5.1 规则 1-7） */
@@ -516,6 +542,24 @@ export function buildSuggestions(input: SuggestionInput): string[] {
   const cpAge = cp?.ok === true ? (cp?.latestAgeDays as number | null | undefined) : null
   if (cpAge !== null && cpAge !== undefined && cpAge > 3) {
     out.push(`【存档】${cpAge} 天未存档（最近 ${cp?.latest ?? '?'}）：checkpoint_create 存档点（保活+试错回滚）`)
+  }
+
+  // 推送积压（2026-11-08 · lh-6446b715 的告警挂点）
+  // 存在理由：44 仓曾静默积压 143 提交 / 20 天，检测全靠「想起来」——而「想起来」不是机制。
+  // ⚠ **不设阈值**（2026-11-08 裁决）：曾加过 `config.gitBacklogThreshold=5` 却从未被读取
+  //   ——死参数比没有参数更坏（它让人以为有控制）。而「积压从 1 个开始」正是本条的教训：
+  //   143 就是从 1 攒起来的，设阈值 5 等于允许 4 个永久挂账。⇒ 有任何积压就报。
+  const gb = input.gitBacklog
+  if (gb && gb.total > 0 && gb.repos.length > 0) {
+    const top = gb.repos
+      .slice()
+      .sort((a, b) => b.ahead - a.ahead)
+      .slice(0, 3)
+      .map((r) => `${r.repo}(${r.ahead})`)
+      .join(' / ')
+    out.push(`【推送】${gb.repos.length} 个仓共 ${gb.total} 个提交未推送（扫描 ${gb.scanned} 仓）：${top}`
+      + `——跑 node scripts/git-ahead-audit.mjs 看全量再逐个 git push。`
+      + `⚠ 曾静默积压 143 提交 / 20 天（lh-6446b715）：这条建议就是那次的告警挂点，别当噪音忽略`)
   }
 
   if (out.length === 0) {

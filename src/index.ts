@@ -30,7 +30,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, resolve } from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import {
   summarizeSelftest, summarizeEmotion, summarizeReflection, summarizeLifeCore,
@@ -39,7 +40,7 @@ import {
   computeProgress, renderProgressLine, NEEDS_EVIDENCE, ADVANCE_TYPES,
   normalizeSalvage, validateSalvage,
 } from './core.ts'
-import type { OrganSnapshot, ProgressSnapshot } from './core.ts'
+import type { OrganSnapshot, ProgressSnapshot, GitBacklog } from './core.ts'
 import { TYPE_LABEL, renderOrganLine, ringMark, clampDays, hasRedRing } from './format.ts'
 import { readHistory, appendHistory } from './history-store.ts'
 
@@ -130,6 +131,44 @@ function resolveCoreDataDir(config: Config): string {
 function resolveEvolveLedger(config: Config): string {
   if (config.evolveLedgerPath) return config.evolveLedgerPath
   return join(dirname(dshHome()), '.evolve', 'ledger.json') // ${DSH_HOME} → 上级目录/.evolve
+}
+
+/**
+ * 采集 git 推送积压（2026-11-08 新增 · lh-6446b715 的告警挂点）。
+ *
+ * 为什么同步 execFileSync：调用方 aggregate() 走感知圈，实测 79 仓 <5 秒；
+ * 设 8 秒硬超时，超时即「读不到」——**观测绝不反噬主流程**。
+ *
+ * 三态（与全库同纪律，别退化）：
+ *   · `null`      = **读不到**（脚本缺失 / 超时 / 非 git 环境）——不是「没积压」
+ *   · `total: 0`  = 读到了，确实干净
+ *   · `total > 0` = 有积压（**低于阈值的也如实返回数字**，由 buildSuggestions 决定报不报）
+ * ⚠ 别把「低于阈值」折成 null：那会让「读过且干净」与「读不到」再次同形。
+ */
+function readGitBacklog(config: Config): GitBacklog | null {
+  try {
+    const script = join(dirname(dshHome()), 'scripts', 'git-ahead-audit.mjs') // ${DSH_HOME} → 上级/scripts
+    if (!existsSync(script)) return null
+    const raw = execFileSync(process.execPath, [script, '--json'], {
+      encoding: 'utf-8',
+      timeout: 8000,
+      windowsHide: true,
+      maxBuffer: 4 * 1024 * 1024,
+    })
+    const data = JSON.parse(raw) as {
+      scanned?: number
+      total?: number
+      pending?: Array<{ repo?: string; ahead?: number }>
+    }
+    const pending = Array.isArray(data.pending) ? data.pending : []
+    return {
+      scanned: typeof data.scanned === 'number' ? data.scanned : 0,
+      total: typeof data.total === 'number' ? data.total : 0,
+      repos: pending.map((p) => ({ repo: String(p?.repo ?? '?'), ahead: Number(p?.ahead) || 0 })),
+    }
+  } catch {
+    return null // 观测不得反噬主流程
+  }
 }
 
 // ---------- 安全读取 ----------
@@ -316,7 +355,9 @@ async function aggregate(config: Config): Promise<{
   const wireFreshDays = config.wireFreshDays
   const convergenceActive = readConvergence(config)
   const { rings, broken } = diagnoseRings({ selftest, lastConfirmedDays, fileActivityDays, wireFreshDays, convergenceActive })
-  const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastConfirmedDays, fileActivityDays, wireFreshDays, convergenceActive })
+  // 推送积压：挂在这里是因为感知圈每次都走 aggregate ⇒ 必然经过 + 周期性（lh-6446b715）
+  const gitBacklog = readGitBacklog(config)
+  const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastConfirmedDays, fileActivityDays, wireFreshDays, convergenceActive, gitBacklog })
   return { organs, rings, broken, suggestions }
 }
 
