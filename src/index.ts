@@ -387,17 +387,19 @@ export function apply(ctx: Context, config: Config): void {
   // 「最近 N 天做了什么」——所以记忆里留完整流水是**纯冗余**，代价是任何一次 recall 命中
   // 就把几万字符塞进上下文。
   const REFLUX_TYPES = new Set(['verdict', 'forge', 'evolve', 'wire', 'reflect', 'checkpoint', 'note'])
-  const refluxEvent = (ev: { type: string; detail: string; id: string | null }): void => {
+  const refluxEvent = (ev: { type: string; detail: string; id: string | null }, sessionId?: string): void => {
     try {
       if (!REFLUX_TYPES.has(ev.type)) return
-      const api = (ctx as unknown as { memoryApi?: { remember(input: { text: string; kind?: string; tags?: string[]; key?: string }): Promise<unknown> } }).memoryApi
+      const api = (ctx as unknown as { memoryApi?: { remember(input: { text: string; kind?: string; tags?: string[]; key?: string; sessionId?: string }): Promise<unknown> } }).memoryApi
       if (api === undefined) return
       const typeLabel: Record<string, string> = { cycle: '感知圈', verdict: '裁决', forge: '炼化', evolve: '评测轮', wire: '布线', reflect: '反思', checkpoint: '存档', note: '备注' }
       const label = typeLabel[ev.type] ?? ev.type
       // 「（最近一次）」写进标题：让读的人一眼知道这条**不是完整履历**，
       // 完整履历在 history.jsonl / evolution_history。不写等于让未来的自己以为流水只有一条。
       const text = '## 进化足迹：' + label + '（最近一次）\n\n' + (ev.detail || '（无说明）')
-      void api.remember({ text, kind: 'fact', key: 'evolve-last-' + ev.type, tags: ['进化履历', ev.type] }).catch(() => { /* 回流失败静默 */ })
+      // 带上会话 id（dsh-agent-memory v0.61）：记忆库据此盖证据坐标。
+      // 取不到就不传——记忆库宁缺不猜，不编假坐标（这条回流常在工具 execute 里发生，exec 有会话）。
+      void api.remember({ text, kind: 'fact', key: 'evolve-last-' + ev.type, tags: ['进化履历', ev.type], ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}) }).catch(() => { /* 回流失败静默 */ })
     } catch { /* 回流失败不阻塞 */ }
   }
 
