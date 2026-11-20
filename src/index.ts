@@ -387,6 +387,17 @@ export function apply(ctx: Context, config: Config): void {
   // 「最近 N 天做了什么」——所以记忆里留完整流水是**纯冗余**，代价是任何一次 recall 命中
   // 就把几万字符塞进上下文。
   const REFLUX_TYPES = new Set(['verdict', 'forge', 'evolve', 'wire', 'reflect', 'checkpoint', 'note'])
+  /**
+   * 从工具执行上下文取会话 id（v0.63 接线 · 台账 lh-e503fb3c）。
+   *
+   * **鸭子类型，不 import 宿主或记忆插件**：这个字段只用于给回流那条记忆盖证据坐标与
+   * 归属，取不到就不传——记忆库的纪律是「宁缺不猜」，编一个假坐标比没有更坏。
+   * 判据与 dsh-agent-memory `role.ts::sessionIdOf` 逐字同构（`header.id` 优先、回退 `session.id`）；
+   * 两处各写一份是因为插件之间不互相 import，而这只有两条判据、不会漂。
+   */
+  type SessionCarrier = { agent?: { session?: { id?: string; header?: { id?: string } } } }
+  const sessionIdOf = (carrier: SessionCarrier | null | undefined): string | undefined =>
+    carrier?.agent?.session?.header?.id ?? carrier?.agent?.session?.id
   const refluxEvent = (ev: { type: string; detail: string; id: string | null }, sessionId?: string): void => {
     try {
       if (!REFLUX_TYPES.has(ev.type)) return
@@ -556,7 +567,7 @@ export function apply(ctx: Context, config: Config): void {
         return [{ type: 'text', text }]
       },
     },
-    async execute(args: { note?: string }) {
+    async execute(args: { note?: string }, exec?: SessionCarrier) {
       // ⚠ **不要**把其余字段显式补成 undefined：dsh-tools 要求返回值整体是合法 JSON，
       // `{ cycleId: undefined }` 会让整个 value 被判 "must be a lossless JSON object"，
       // 而报错指向对象本身、看不出是哪个字段。这些字段都非 required，省略键才是对的。
@@ -568,7 +579,7 @@ export function apply(ctx: Context, config: Config): void {
       // 但口径顺序写死「先读后记」，避免将来有人给 cycle 算进推进时读到自己这一条。
       const progress = computeProgress(readHistory(dataDir), new Date(), config.advanceIdleHours)
       const loggedEv = appendHistory(dataDir, { type: 'cycle', detail: args.note ?? '' })
-      if (loggedEv !== null) refluxEvent({ type: 'cycle', detail: args.note ?? '', id: loggedEv.id })
+      if (loggedEv !== null) refluxEvent({ type: 'cycle', detail: args.note ?? '', id: loggedEv.id }, sessionIdOf(exec))
       const evolveIdle = agg.organs.evolve?.ok === true ? (agg.organs.evolve.idleDays as number | null | undefined) ?? null : null
       const statusPayload = {
         organs: JSON.parse(JSON.stringify(agg.organs)),
@@ -647,7 +658,7 @@ export function apply(ctx: Context, config: Config): void {
         return [{ type: 'text', text }]
       },
     },
-    async execute(args: { type: string; detail?: string; ref?: string; evidence?: string; delta?: string; salvage?: string[] }) {
+    async execute(args: { type: string; detail?: string; ref?: string; evidence?: string; delta?: string; salvage?: string[] }, exec?: SessionCarrier) {
       if (!config.enabled) return { ok: false, error: 'evolution-core disabled' }
       const salvage = normalizeSalvage(args.salvage)
       // fail-closed：裁决必须显式回答「有没有可带走的组件」。判据在 core.validateSalvage
@@ -656,7 +667,7 @@ export function apply(ctx: Context, config: Config): void {
       if (salvageError !== null) return { ok: false, error: salvageError }
       const ev = appendHistory(dataDir, { type: args.type, detail: args.detail ?? '', ref: args.ref ?? null, evidence: args.evidence, delta: args.delta, salvage })
       if (ev === null) return { ok: false, error: 'history.jsonl 写入失败' }
-      refluxEvent({ type: args.type, detail: (args.detail ?? '') + (args.evidence ? ' · 证据 ' + args.evidence : '') + (salvage.length > 0 ? ` · 可复用 ${String(salvage.length)} 条` : ''), id: ev.id })
+      refluxEvent({ type: args.type, detail: (args.detail ?? '') + (args.evidence ? ' · 证据 ' + args.evidence : '') + (salvage.length > 0 ? ` · 可复用 ${String(salvage.length)} 条` : ''), id: ev.id }, sessionIdOf(exec))
       return {
         ok: true,
         type: args.type,
