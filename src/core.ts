@@ -443,6 +443,33 @@ export interface GitBacklog {
   repos: Array<{ repo: string; ahead: number }>
 }
 
+/**
+ * 技能镜像漂移（2026-11-28 新增 · lh-a07a0436 的告警挂点）。
+ *
+ * 存在理由：`sync-skills.ps1 -Check` 是一道**手跑的闸**——不跑就不知道有漂移。
+ * 2026-11-28 实测：两个技能改完没同步、三个技能从来没进过镜像，全靠「想起来才查」。
+ * 而「想起来」不是机制（AGENTS.md §3.4：能变机制就做机制）。
+ * 挂点与 git 积压同源：感知圈每次都走 aggregate ⇒ 必然经过 + 周期性，不引入外部节拍器。
+ *
+ * 三态（与 GitBacklog 同纪律，别退化）：
+ *   · 缺省 / null   = **未采集或采集失败**——不产生建议，也不报平安
+ *   · `drifted: 0`  = 读到了，没有漂移
+ *   · `drifted: N`  = 有 N 项漂移
+ *   · `drifted: null` = 退出码说「有漂移」但数量解析不出 ⇒ 报「数量未知」，**不猜 0**
+ *   后者是刻意留的一档：脚本改措辞时读数会降级，但闸不会静默失效。
+ */
+export interface SkillDrift {
+  /** 漂移项数；null = 确认有漂移但数不出来（不是 0） */
+  drifted: number | null
+  /**
+   * 非预期退出码（脚本自己 fail-loud 的 2=路径缺失 / 3=真源同名冲突）。
+   *
+   * 有值时 `drifted` 无意义——**读数本身不成立**。必须报出来：
+   * 环境坏了却沉默，比「不知道」更坏。
+   */
+  errorCode?: number
+}
+
 export interface SuggestionInput {
   selftest?: OrganSnapshot
   evolve?: OrganSnapshot
@@ -466,6 +493,13 @@ export interface SuggestionInput {
    * 此时**不产生建议也不报平安**——「读不到」不是「没积压」，印成 0 就是把未知伪装成健康。
    */
   gitBacklog?: GitBacklog | null
+  /**
+   * 技能镜像漂移（可选）。
+   *
+   * 三态语义与 gitBacklog 同纪律：缺省 / null = **未采集或采集失败**，
+   * 此时**不产生建议也不报平安**。
+   */
+  skillDrift?: SkillDrift | null
 }
 
 /** 生成行动建议（优先级排序，来自设计 §5.1 规则 1-7） */
@@ -560,6 +594,24 @@ export function buildSuggestions(input: SuggestionInput): string[] {
     out.push(`【推送】${gb.repos.length} 个仓共 ${gb.total} 个提交未推送（扫描 ${gb.scanned} 仓）：${top}`
       + `——跑 node scripts/git-ahead-audit.mjs 看全量再逐个 git push。`
       + `⚠ 曾静默积压 143 提交 / 20 天（lh-6446b715）：这条建议就是那次的告警挂点，别当噪音忽略`)
+  }
+
+  // 技能镜像漂移（2026-11-28 · lh-a07a0436 的告警挂点）
+  // 与推送积压同形：**不设阈值**（漂移从 1 项开始就该同步），读不到就沉默（不报平安）。
+  // 三态在读数里分开报——「有漂移但数不出」「检查本身跑不通」都不能折进「无漂移」。
+  const sd = input.skillDrift
+  if (sd) {
+    if (sd.errorCode !== undefined) {
+      out.push(`⚠ 技能镜像检查跑不通（sync-skills.ps1 退出码 ${sd.errorCode}：2=路径缺失 / 3=真源同名冲突）`
+        + `——**读数不成立**，先修环境再谈漂移。这不是「无漂移」`)
+    } else if (sd.drifted === null) {
+      out.push('【技能】镜像有漂移但数量解析不出（脚本输出措辞变了？）'
+        + '——跑 `powershell -File repos/alice-self-assets/scripts/sync-skills.ps1 -Check` 看原文')
+    } else if (sd.drifted > 0) {
+      out.push(`【技能】真源与镜像有 ${sd.drifted} 项漂移：跑 sync-skills.ps1（不带 -Check）同步，再提交镜像仓`
+        + `。⚠ 为什么挂在这里：2026-11-28 实测两个技能改完没同步、三个技能从未进过镜像，全靠「想起来才查」`
+        + `——而手跑的闸等于没有闸；另一头，一直红的闸也没人看，所以同步后要让它回 0`)
+    }
   }
 
   if (out.length === 0) {

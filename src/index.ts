@@ -40,7 +40,7 @@ import {
   computeProgress, renderProgressLine, NEEDS_EVIDENCE, ADVANCE_TYPES,
   normalizeSalvage, validateSalvage,
 } from './core.ts'
-import type { OrganSnapshot, ProgressSnapshot, GitBacklog } from './core.ts'
+import type { OrganSnapshot, ProgressSnapshot, GitBacklog, SkillDrift } from './core.ts'
 import { TYPE_LABEL, renderOrganLine, ringMark, clampDays, hasRedRing } from './format.ts'
 import { readHistory, appendHistory } from './history-store.ts'
 
@@ -168,6 +168,72 @@ function readGitBacklog(config: Config): GitBacklog | null {
     }
   } catch {
     return null // 观测不得反噬主流程
+  }
+}
+
+/**
+ * 技能镜像漂移（2026-11-28 新增 · lh-a07a0436 的告警挂点）。
+ *
+ * 为什么挂这里：`sync-skills.ps1 -Check` 是一道**手跑的闸**——不跑就不知道有漂移。
+ * 2026-11-28 实测：两个技能改完没同步、三个技能从来没进过镜像，全靠「想起来才查」。
+ * 而「想起来」不是机制。感知圈每次走 aggregate ⇒ 必然经过 + 周期性（与 git 积压同源）。
+ *
+ * **仪器先探后跑**（2026-11-28 实测，两个 shell 都测过）：
+ *   exit 0 ⇒ stdout 含「✔ 无漂移」；exit 1 ⇒ stdout 含「✖ 有漂移（N 项）」。
+ *   耗时 pwsh ≈0.9s / powershell ≈1.4s。设 20s 硬超时——**观测绝不反噬主流程**。
+ *
+ * 三态（与 readGitBacklog 同纪律，别退化）：
+ *   · `null`         = **读不到**（脚本缺失 / 无 PowerShell / 超时 / spawn 失败）
+ *   · `{drifted:0}`  = 读到了，没有漂移
+ *   · `{drifted:N}`  = 有 N 项漂移
+ *   · `{drifted:null,errorCode:N}` = 脚本 fail-loud（2=路径缺失 / 3=真源冲突）⇒ 读数不成立
+ *   · `{drifted:null}`             = 退出码说「有漂移」但数不出来 ⇒ **不猜 0**，报「数量未知」
+ * ⚠ 后两档不许折成 null：那会让「确认有漂移」和「读不到」同形，而这正是本条要防的形状。
+ */
+function skillDriftScript(): string {
+  // 与 git-ahead-audit.mjs 同根：${DSH_HOME} → 上级/repos/alice-self-assets
+  return join(dirname(dshHome()), 'repos', 'alice-self-assets', 'scripts', 'sync-skills.ps1')
+}
+
+/** 探测可用的 PowerShell（首次后缓存；null = 两个都没有 ⇒ 这条检查不可用，不报平安） */
+let psBinCache: string | null | undefined
+function resolvePowerShell(): string | null {
+  if (psBinCache !== undefined) return psBinCache
+  for (const bin of ['pwsh', 'powershell']) {
+    try {
+      execFileSync(bin, ['-NoProfile', '-NonInteractive', '-Command', 'exit 0'], { timeout: 5000, windowsHide: true })
+      psBinCache = bin
+      return bin
+    } catch {
+      // ENOENT 或执行失败：试下一个
+    }
+  }
+  psBinCache = null
+  return null
+}
+
+function readSkillDrift(): SkillDrift | null {
+  try {
+    const script = skillDriftScript()
+    if (!existsSync(script)) return null
+    const bin = resolvePowerShell()
+    if (!bin) return null
+    execFileSync(bin, ['-NoProfile', '-NonInteractive', '-File', script, '-Check'], {
+      encoding: 'utf-8',
+      timeout: 20000,
+      windowsHide: true,
+      maxBuffer: 4 * 1024 * 1024,
+    })
+    return { drifted: 0 }
+  } catch (e) {
+    const err = e as { status?: number; stdout?: string | Buffer }
+    const status = err?.status
+    if (status === undefined) return null // 超时 / spawn 失败 ⇒ 读不到
+    if (status !== 1) return { drifted: null, errorCode: status } // 2/3 = 环境问题，要报不要吞
+    const raw = err?.stdout
+    const text = typeof raw === 'string' ? raw : raw?.toString('utf-8') ?? ''
+    const m = text.match(/有漂移（(\d+) 项）/)
+    return { drifted: m ? Number(m[1]) : null }
   }
 }
 
@@ -357,7 +423,9 @@ async function aggregate(config: Config): Promise<{
   const { rings, broken } = diagnoseRings({ selftest, lastConfirmedDays, fileActivityDays, wireFreshDays, convergenceActive })
   // 推送积压：挂在这里是因为感知圈每次都走 aggregate ⇒ 必然经过 + 周期性（lh-6446b715）
   const gitBacklog = readGitBacklog(config)
-  const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastConfirmedDays, fileActivityDays, wireFreshDays, convergenceActive, gitBacklog })
+  // 技能镜像漂移：同一挂点、同一理由（lh-a07a0436）
+  const skillDrift = readSkillDrift()
+  const suggestions = buildSuggestions({ selftest, evolve: organs.evolve, checkpoints: organs.checkpoints, lastConfirmedDays, fileActivityDays, wireFreshDays, convergenceActive, gitBacklog, skillDrift })
   return { organs, rings, broken, suggestions }
 }
 

@@ -404,6 +404,68 @@ test('★ Config 里不得再有 gitBacklogThreshold（死参数的机械锁）'
   }
 })
 
+// ★ 技能镜像漂移（2026-11-28 · lh-a07a0436）：与推送积压同一个挂点、同一条纪律——
+//   判据不是「代码里有这一段」，是「有漂移会报 / 读不到不伪造平安 / 数不出不猜 0」。
+//   存在理由：`sync-skills.ps1 -Check` 原本是手跑的闸，2026-11-28 实测两个技能改完没同步、
+//   三个技能从未进过镜像——全靠「想起来才查」，而想起来不是机制。
+const sdBase = gbBase
+
+test('★ buildSuggestions：技能镜像漂移 N 项 → 出【技能】建议并点名数量 + 可执行动作', () => {
+  const out = buildSuggestions({ ...sdBase, skillDrift: { drifted: 1 } })
+  const s = out.find((x) => x.startsWith('【技能】'))
+  assert.ok(s, '有漂移必须出建议')
+  assert.match(s, /1 项漂移/)
+  assert.match(s, /sync-skills\.ps1/, '只报「有漂移」不够，必须给出可执行动作')
+})
+
+test('★ 不设阈值：漂移 1 项就报——积压与漂移都是从 1 攒起来的', () => {
+  const out = buildSuggestions({ ...sdBase, skillDrift: { drifted: 1 } })
+  assert.equal(out.filter((x) => x.startsWith('【技能】')).length, 1)
+})
+
+test('★ 三态：skillDrift 缺省或 null（读不到）⇒ 不出建议，也不印「无漂移」的平安', () => {
+  for (const v of [undefined, null]) {
+    const out = buildSuggestions({ ...sdBase, skillDrift: v })
+    assert.equal(out.filter((x) => x.startsWith('【技能】')).length, 0, `skillDrift=${v} 不该报`)
+    assert.ok(!out.some((s) => /无漂移|镜像正常|技能已同步/.test(s)), '读不到 ≠ 没漂移，不许伪造平安')
+  }
+})
+
+test('★ drifted=0（读了且干净）⇒ 不报——与「读不到」同为不出建议，区分在采集层', () => {
+  const out = buildSuggestions({ ...sdBase, skillDrift: { drifted: 0 } })
+  assert.equal(out.filter((x) => x.startsWith('【技能】')).length, 0)
+})
+
+// ★ 关键分档（2026-11-28 设计）：退出码说「有漂移」但数量解析不出 ⇒ **不许猜 0**。
+//   它与 drifted:0 必须报出不同的东西，否则「数不出」会静默变成「干净」——
+//   那正是本条要防的形状（脚本改措辞 ⇒ 闸失效且无人知道）。
+test('★ drifted=null（确认有漂移但数不出）⇒ 报「数量未知」，绝不当 0', () => {
+  const out = buildSuggestions({ ...sdBase, skillDrift: { drifted: null } })
+  const s = out.find((x) => x.startsWith('【技能】'))
+  assert.ok(s, '确认有漂移就不能沉默')
+  assert.match(s, /解析不出/)
+  assert.doesNotMatch(s, /0 项/, '数不出时报 0 项，等于把未知伪装成干净')
+})
+
+// ★ 环境坏了也要报：sync-skills.ps1 自己 fail-loud 的 2=路径缺失 / 3=真源同名冲突。
+//   折进 null 会让「环境坏了」和「读不到」同形——而环境坏了正是最该被看见的那种。
+test('★ errorCode=2/3（检查本身跑不通）⇒ 报「读数不成立」，不折进无漂移', () => {
+  for (const code of [2, 3]) {
+    const out = buildSuggestions({ ...sdBase, skillDrift: { drifted: null, errorCode: code } })
+    const s = out.find((x) => x.startsWith('⚠ 技能镜像检查跑不通'))
+    assert.ok(s, `退出码 ${code} 必须报`)
+    assert.match(s, /读数不成立/)
+    assert.match(s, new RegExp(`退出码 ${code}`))
+  }
+})
+
+test('退化：skillDrift 脏输入（空对象 / 字符串）→ 不抛也不报', () => {
+  let out
+  assert.doesNotThrow(() => { out = buildSuggestions({ ...sdBase, skillDrift: {} }) })
+  assert.equal(out.filter((x) => x.startsWith('【技能】')).length, 0)
+  assert.doesNotThrow(() => buildSuggestions({ ...sdBase, skillDrift: 'x' }))
+})
+
 // ★ 收敛声明影响建议文案（2026-10-31 · t-8df40786）：声明后不再催推进——
 //   催一次是提醒，催四十次是噪音；但反例护栏（有 active / 有 finding）不成立时仍要催。
 test('★ buildSuggestions：已声明收敛 ⇒ 不催推进；无声明或有 active 时仍催', () => {
